@@ -1,0 +1,25 @@
+{
+  "name": "budgetalert",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Budget tracking bot: parses bank alert emails, tracks spend against a budget, sends threshold alerts and weekly summaries to a Telegram group, and answers on-demand budget checks.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "db:init": "wrangler d1 execute budgetalert --file=./schema.sql",
+    "db:init:local": "wrangler d1 execute budgetalert --local --file=./schema.sql"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "wrangler": "^3.72.0"
+  },
+  "dependencies": {
+    "postal-mime": "^2.2.7"
+  }
+}
