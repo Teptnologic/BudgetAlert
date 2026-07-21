@@ -25,7 +25,15 @@ export async function handleFetch(request: Request, env: Env): Promise<Response>
       }
     }
     const update = await request.json().catch(() => null);
-    if (update) await handleTelegramUpdate(update, env);
+    if (update) {
+      try {
+        await handleTelegramUpdate(update, env);
+      } catch (err) {
+        // Log for `wrangler tail` but still return 200, so Telegram doesn't
+        // retry the same failing update forever.
+        console.error("telegram handler error:", err);
+      }
+    }
     return new Response("ok", { status: 200 });
   }
 
@@ -35,10 +43,14 @@ export async function handleFetch(request: Request, env: Env): Promise<Response>
       | { subject?: string; text?: string; date?: string }
       | null;
     if (!body) return new Response("bad request", { status: 400 });
-    const parsed = parseTransaction(`${body.subject ?? ""}\n${body.text ?? ""}`);
-    if (parsed) {
-      const occurredAt = body.date ? new Date(body.date).toISOString() : new Date().toISOString();
-      await recordAndEvaluate(env, parsed, occurredAt, "webhook");
+    try {
+      const parsed = parseTransaction(`${body.subject ?? ""}\n${body.text ?? ""}`);
+      if (parsed) {
+        const occurredAt = body.date ? new Date(body.date).toISOString() : new Date().toISOString();
+        await recordAndEvaluate(env, parsed, occurredAt, "webhook");
+      }
+    } catch (err) {
+      console.error("inbound webhook error:", err);
     }
     return new Response("ok", { status: 200 });
   }

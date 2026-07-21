@@ -10,7 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "db:init": "wrangler d1 execute budgetalert --file=./schema.sql",
+    "db:init": "wrangler d1 execute budgetalert --remote --file=./schema.sql",
     "db:init:local": "wrangler d1 execute budgetalert --local --file=./schema.sql"
   },
   "devDependencies": {

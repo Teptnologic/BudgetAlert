@@ -12,7 +12,11 @@ import { sendMessage } from "./notify/telegram";
 
 export default {
   async email(message: any, env: Env, _ctx: ExecutionContext): Promise<void> {
-    await handleEmail(message, env);
+    try {
+      await handleEmail(message, env);
+    } catch (err) {
+      console.error("email handler error:", err);
+    }
   },
 
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
