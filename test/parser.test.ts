@@ -56,6 +56,24 @@ describe("parseTransaction", () => {
     expect(parseTransaction("Win $1000 in our giveaway")).toBeNull();
   });
 
+  it("parses a Chase alert without a merchant clause", () => {
+    const r = parseTransaction("You made a $10.46 transaction");
+    expect(r?.amount).toBe(10.46);
+    expect(r?.currency).toBe("USD");
+  });
+
+  it("parses a Chase alert with a merchant", () => {
+    const r = parseTransaction("You made a $10.46 transaction with STARBUCKS on July 21, 2026");
+    expect(r?.amount).toBe(10.46);
+    expect(r?.merchant).toBe("STARBUCKS");
+  });
+
+  it("does not treat 'with your ... card' as a merchant", () => {
+    const r = parseTransaction("You made a $10.46 transaction with your Freedom card");
+    expect(r?.amount).toBe(10.46);
+    expect(r?.merchant).toBeNull();
+  });
+
   it("copes with missing merchant", () => {
     const r = parseTransaction("You spent $5.00");
     expect(r?.amount).toBe(5);

@@ -86,9 +86,29 @@ const genericRule: Rule = {
   },
 };
 
+// Chase alerts read: "You made a $10.46 transaction with MERCHANT on <date>".
+// The generic rule gets the amount but misses the merchant (Chase uses "with",
+// not "at"), so handle Chase explicitly.
+const chaseRule: Rule = {
+  name: "chase",
+  extract(text) {
+    if (NON_SPEND.test(text)) return null;
+    const m = text.match(
+      /you made a\s+\$?([0-9](?:[0-9,]*)(?:\.[0-9]{1,2})?)\s+transaction(?:\s+with\s+(.+?))?(?=\s+on\b|[.,;!]|$)/i,
+    );
+    if (!m) return null;
+    const amount = toNumber(m[1]);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    let merchant = m[2]?.trim().replace(/\s+/g, " ") ?? null;
+    // Guard against "...transaction with your Freedom card" style phrasing.
+    if (merchant && /^your\b/i.test(merchant)) merchant = null;
+    return { amount, merchant: merchant || null, currency: "USD" };
+  },
+};
+
 // Bank-specific rules run first; add entries here for banks whose wording the
 // generic rule mis-parses. Each returns a ParsedTxn or null.
-const BANK_RULES: Rule[] = [];
+const BANK_RULES: Rule[] = [chaseRule];
 
 export function parseTransaction(rawText: string): ParsedTxn | null {
   const text = (rawText ?? "").replace(/\s+/g, " ").trim();
