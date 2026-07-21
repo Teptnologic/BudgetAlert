@@ -99,7 +99,7 @@ const chaseRule: Rule = {
     if (!m) return null;
     const amount = toNumber(m[1]);
     if (!Number.isFinite(amount) || amount <= 0) return null;
-    let merchant = m[2]?.trim().replace(/\s+/g, " ") ?? null;
+    let merchant: string | null = m[2] ? m[2].trim().replace(/\s+/g, " ") : null;
     // Guard against "...transaction with your Freedom card" style phrasing.
     if (merchant && /^your\b/i.test(merchant)) merchant = null;
     return { amount, merchant: merchant || null, currency: "USD" };

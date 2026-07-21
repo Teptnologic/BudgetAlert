@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS config (
   id            INTEGER PRIMARY KEY CHECK (id = 1),
   budget_amount REAL    NOT NULL DEFAULT 0,
   currency      TEXT    NOT NULL DEFAULT 'USD',
-  period        TEXT    NOT NULL DEFAULT 'monthly',  -- 'monthly' | 'weekly'
+  period        TEXT    NOT NULL DEFAULT 'weekly',   -- 'weekly' | 'monthly'
   warn_pct      REAL    NOT NULL DEFAULT 80,
   alert_pct     REAL    NOT NULL DEFAULT 100,
   group_chat_id TEXT                                  -- Telegram chat to notify

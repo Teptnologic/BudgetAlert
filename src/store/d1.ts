@@ -48,6 +48,10 @@ export async function setGroupChat(env: Env, chatId: string): Promise<void> {
   await env.DB.prepare(`UPDATE config SET group_chat_id = ? WHERE id = 1`).bind(chatId).run();
 }
 
+export async function setPeriod(env: Env, period: "weekly" | "monthly"): Promise<void> {
+  await env.DB.prepare(`UPDATE config SET period = ? WHERE id = 1`).bind(period).run();
+}
+
 // Returns true if inserted, false if this was a duplicate (same raw_hash).
 export async function insertTransaction(env: Env, txn: NewTxn): Promise<boolean> {
   const res = await env.DB.prepare(

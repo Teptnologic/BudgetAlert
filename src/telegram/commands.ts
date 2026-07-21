@@ -6,7 +6,7 @@
 //   /help                            → command list
 
 import type { Env } from "../env";
-import { setBudget, setGroupChat, getConfig } from "../store/d1";
+import { setBudget, setGroupChat, setPeriod, getConfig } from "../store/d1";
 import { budgetStatusText } from "../service";
 import { sendMessage } from "../notify/telegram";
 import { formatMoney } from "../core/engine";
@@ -49,6 +49,18 @@ export async function handleTelegramUpdate(update: TgUpdate, env: Env): Promise<
       return;
     }
 
+    case "/period": {
+      const p = arg.toLowerCase();
+      const period = p.startsWith("week") ? "weekly" : p.startsWith("month") ? "monthly" : null;
+      if (!period) {
+        await sendMessage(env, chat, "Usage: <code>/period weekly</code> or <code>/period monthly</code>");
+        return;
+      }
+      await setPeriod(env, period);
+      await sendMessage(env, chat, `✅ Budget period set to <b>${period}</b>.`);
+      return;
+    }
+
     case "/setgroup":
       await setGroupChat(env, chat);
       await sendMessage(
@@ -66,6 +78,7 @@ export async function handleTelegramUpdate(update: TgUpdate, env: Env): Promise<
         "<b>BudgetAlert</b>\n" +
           "/status — how much budget is left\n" +
           "/budget &lt;amount&gt; — set your budget\n" +
+          "/period weekly|monthly — set the budget window\n" +
           "/setgroup — send alerts &amp; summaries here\n" +
           "/help — this message",
       );
