@@ -62,6 +62,17 @@ describe("parseTransaction", () => {
     expect(r?.currency).toBe("USD");
   });
 
+  it("reads the merchant from the Chase subject, not the body", () => {
+    // Real Chase shape: merchant is at the end of the subject; the body is
+    // boilerplate that must NOT leak into the merchant.
+    const subject = "You made a $84.00 transaction with TOP GOLF BAY RESERVA";
+    const body =
+      "Account ending in (...1234). Don't recognize it? Call us. Reply STOP to unsubscribe. Manage alerts at chase.com.";
+    const r = parseTransaction(subject, body);
+    expect(r?.amount).toBe(84);
+    expect(r?.merchant).toBe("TOP GOLF BAY RESERVA");
+  });
+
   it("parses a Chase alert with a merchant", () => {
     const r = parseTransaction("You made a $10.46 transaction with STARBUCKS on July 21, 2026");
     expect(r?.amount).toBe(10.46);

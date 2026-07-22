@@ -19,7 +19,7 @@ export async function handleEmail(message: EmailMessage, env: Env): Promise<void
 
   const subject = email.subject ?? "";
   const body = email.text ?? stripHtml(email.html ?? "");
-  const parsed = parseTransaction(`${subject}\n${body}`);
+  const parsed = parseTransaction(subject, body);
   if (!parsed) return;
 
   const occurredAt = (email.date ? new Date(email.date) : new Date()).toISOString();

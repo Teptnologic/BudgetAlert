@@ -44,7 +44,7 @@ export async function handleFetch(request: Request, env: Env): Promise<Response>
       | null;
     if (!body) return new Response("bad request", { status: 400 });
     try {
-      const parsed = parseTransaction(`${body.subject ?? ""}\n${body.text ?? ""}`);
+      const parsed = parseTransaction(body.subject ?? "", body.text ?? "");
       if (parsed) {
         const occurredAt = body.date ? new Date(body.date).toISOString() : new Date().toISOString();
         await recordAndEvaluate(env, parsed, occurredAt, "webhook");

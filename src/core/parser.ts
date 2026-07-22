@@ -26,7 +26,11 @@ const CURRENCY_SYMBOL: Record<string, string> = {
 
 interface Rule {
   name: string;
-  extract: (text: string) => ParsedTxn | null;
+  // `subject` is the email subject alone; `combined` is subject + body. Some
+  // banks (Chase) put the merchant at the end of the subject, so keeping the
+  // subject boundary matters — merging them lets a merchant match bleed into
+  // body text.
+  extract: (subject: string, combined: string) => ParsedTxn | null;
 }
 
 // Pull the first monetary amount, supporting "$42.10", "USD 42.10", "42.10 GBP".
@@ -73,28 +77,30 @@ function normalizeCurrency(token: string): string | null {
 // Generic rule that handles the vast majority of bank alert formats.
 const genericRule: Rule = {
   name: "generic",
-  extract(text) {
-    if (NON_SPEND.test(text)) return null;
-    if (!SPEND_HINT.test(text)) return null;
-    const money = findAmount(text);
+  extract(_subject, combined) {
+    if (NON_SPEND.test(combined)) return null;
+    if (!SPEND_HINT.test(combined)) return null;
+    const money = findAmount(combined);
     if (!money || !Number.isFinite(money.amount) || money.amount <= 0) return null;
     return {
       amount: money.amount,
-      merchant: findMerchant(text),
+      merchant: findMerchant(combined),
       currency: money.currency,
     };
   },
 };
 
-// Chase alerts read: "You made a $10.46 transaction with MERCHANT on <date>".
-// The generic rule gets the amount but misses the merchant (Chase uses "with",
-// not "at"), so handle Chase explicitly.
+// Chase alerts put everything in the SUBJECT:
+//   "You made a $10.46 transaction with TOP GOLF BAY RESERVA"
+// The merchant runs to the end of the subject (and is often truncated by
+// Chase). Parse from the subject alone so the merchant match can't spill into
+// body text. A trailing "on <date>" clause, if present, is dropped.
 const chaseRule: Rule = {
   name: "chase",
-  extract(text) {
-    if (NON_SPEND.test(text)) return null;
-    const m = text.match(
-      /you made a\s+\$?([0-9](?:[0-9,]*)(?:\.[0-9]{1,2})?)\s+transaction(?:\s+with\s+(.+?))?(?=\s+on\b|[.,;!]|$)/i,
+  extract(subject) {
+    if (NON_SPEND.test(subject)) return null;
+    const m = subject.match(
+      /you made a\s+\$?([0-9](?:[0-9,]*)(?:\.[0-9]{1,2})?)\s+transaction(?:\s+with\s+(.+?)(?:\s+on\s.*)?)?$/i,
     );
     if (!m) return null;
     const amount = toNumber(m[1]);
@@ -110,11 +116,14 @@ const chaseRule: Rule = {
 // generic rule mis-parses. Each returns a ParsedTxn or null.
 const BANK_RULES: Rule[] = [chaseRule];
 
-export function parseTransaction(rawText: string): ParsedTxn | null {
-  const text = (rawText ?? "").replace(/\s+/g, " ").trim();
-  if (!text) return null;
+const collapse = (s: string): string => (s ?? "").replace(/\s+/g, " ").trim();
+
+export function parseTransaction(subject: string, body = ""): ParsedTxn | null {
+  const subj = collapse(subject);
+  const combined = collapse(`${subject}\n${body}`);
+  if (!combined) return null;
   for (const rule of [...BANK_RULES, genericRule]) {
-    const result = rule.extract(text);
+    const result = rule.extract(subj, combined);
     if (result) return result;
   }
   return null;
