@@ -23,6 +23,7 @@ import {
   upsertCategory,
   setCategoryBudget,
   setTxnCategory,
+  setTxnAmount,
   setBudget,
   setPeriod,
 } from "../store/d1";
@@ -157,6 +158,33 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<Planne
       };
     }
 
+    case "set_transaction_amount": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
+      }
+      if (intent.newAmount <= 0) {
+        return { ok: false, text: "⚠️ No new amount given." };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
+      if (!txn) {
+        const what =
+          intent.selectorKind === "amount"
+            ? `matching ${money(intent.amount)}`
+            : intent.selectorKind === "merchant"
+              ? `matching “${esc(intent.selectorValue)}”`
+              : "to change";
+        return { ok: false, text: `⚠️ No transaction ${what}.` };
+      }
+      p.claimedTxnIds.push(txn.id);
+      return {
+        ok: true,
+        text:
+          `Change ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
+          `to <b>${money(intent.newAmount)}</b>`,
+      };
+    }
+
     // Reads are always valid; they run after any writes so they see fresh state.
     case "get_status":
       return { ok: true, text: "Show budget status" };
@@ -230,6 +258,23 @@ async function applyStep(
       return {
         ok: true,
         text: `Moved ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} → <b>${esc(cat.label)}</b>`,
+      };
+    }
+
+    case "set_transaction_amount": {
+      if (intent.selectorKind === "none" || intent.newAmount <= 0) {
+        return { ok: false, text: "That change is no longer valid" };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      if (!txn) return { ok: false, text: "That transaction is no longer there" };
+      claimed.push(txn.id);
+      await setTxnAmount(env, txn.id, intent.newAmount);
+      return {
+        ok: true,
+        text:
+          `Changed ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
+          `to <b>${money(intent.newAmount)}</b>`,
       };
     }
 

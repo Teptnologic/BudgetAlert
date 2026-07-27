@@ -261,7 +261,13 @@ describe("normalizeIntent", () => {
 
 describe("isMutating", () => {
   it("flags exactly the write actions", () => {
-    for (const a of ["move_transaction", "set_budget", "create_category", "set_period"] as const) {
+    for (const a of [
+      "move_transaction",
+      "set_transaction_amount",
+      "set_budget",
+      "create_category",
+      "set_period",
+    ] as const) {
       expect(isMutating(a)).toBe(true);
     }
     for (const a of ["get_status", "query_spend", "list_recent", "unknown"] as const) {
@@ -380,6 +386,65 @@ describe("planBatch projection", () => {
       normalizeBatch({
         actions: [
           { action: "move_transaction", category: "gift", selector_kind: "last" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("TOP GOLF BAY RESERVA");
+    expect(steps[1].text).toContain("STARBUCKS");
+  });
+
+  it("plans an amount correction, naming both the old and new figure", async () => {
+    const env = fakeEnv({ transactions: txns });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "set_transaction_amount", selector_kind: "amount", amount: 84, new_amount: 48.6 },
+        ],
+      }),
+    );
+    expect(steps[0].ok).toBe(true);
+    expect(steps[0].text).toContain("STARBUCKS");
+    expect(steps[0].text).toContain("$84.00");
+    expect(steps[0].text).toContain("$48.60");
+  });
+
+  it("rejects an amount correction with no new amount", async () => {
+    const env = fakeEnv({ transactions: txns });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [{ action: "set_transaction_amount", selector_kind: "last", new_amount: 0 }],
+      }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].text).toContain("No new amount");
+  });
+
+  // The identifying amount and the replacement amount must not collapse into
+  // one another — that would silently rewrite the wrong figure.
+  it("keeps the identifying amount separate from the new amount", () => {
+    const [i] = normalizeBatch({
+      actions: [
+        { action: "set_transaction_amount", selector_kind: "amount", amount: 84, new_amount: 48.6 },
+      ],
+    });
+    expect(i.amount).toBe(84);
+    expect(i.newAmount).toBe(48.6);
+  });
+
+  it("correcting an amount then moving it targets different transactions", async () => {
+    const env = fakeEnv({
+      categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+      transactions: txns,
+    });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "set_transaction_amount", selector_kind: "last", new_amount: 210 },
           { action: "move_transaction", category: "gift", selector_kind: "last" },
         ],
       }),

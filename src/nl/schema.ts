@@ -27,6 +27,7 @@ const ACTION_SCHEMA = {
     "category",
     "category_label",
     "amount",
+    "new_amount",
     "period",
     "window",
     "selector_kind",
@@ -42,6 +43,7 @@ const ACTION_SCHEMA = {
         "query_spend",
         "list_recent",
         "move_transaction",
+        "set_transaction_amount",
         "set_budget",
         "create_category",
         "set_period",
@@ -63,6 +65,11 @@ const ACTION_SCHEMA = {
       type: "number",
       description:
         "Money amount in the message for set_budget/create_category, or the amount used to identify a transaction when selector_kind is 'amount'. 0 when not applicable.",
+    },
+    new_amount: {
+      type: "number",
+      description:
+        "For set_transaction_amount only: the corrected amount the transaction should become. In 'change the $84 charge to $48', amount is 84 (which transaction) and new_amount is 48 (what it becomes). 0 when not applicable.",
     },
     period: {
       type: "string",
@@ -125,6 +132,7 @@ export type Action =
   | "query_spend"
   | "list_recent"
   | "move_transaction"
+  | "set_transaction_amount"
   | "set_budget"
   | "create_category"
   | "set_period"
@@ -140,6 +148,7 @@ export interface Intent {
   category: string;
   categoryLabel: string;
   amount: number;
+  newAmount: number;
   period: PeriodOrNone;
   window: Window;
   selectorKind: SelectorKind;
@@ -151,6 +160,7 @@ export interface Intent {
 // Which actions change stored data (and therefore need confirmation).
 const MUTATING: ReadonlySet<Action> = new Set<Action>([
   "move_transaction",
+  "set_transaction_amount",
   "set_budget",
   "create_category",
   "set_period",
@@ -198,6 +208,7 @@ export function normalizeIntent(raw: unknown): Intent {
     category: str(o.category).toLowerCase(),
     categoryLabel: str(either("category_label", "categoryLabel")),
     amount: Math.abs(num(o.amount)),
+    newAmount: Math.abs(num(either("new_amount", "newAmount"))),
     period: pickEnum<PeriodOrNone>(o.period, PERIODS, "none"),
     window: pickEnum<Window>(o.window, WINDOWS, "none"),
     selectorKind: pickEnum<SelectorKind>(either("selector_kind", "selectorKind"), SELECTORS, "none"),

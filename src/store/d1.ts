@@ -233,6 +233,15 @@ export async function findTransaction(
     .first<FullTxnRow>();
 }
 
+// Correct a captured amount — bank alerts often land pre-tip, or get the figure
+// wrong outright. Budget totals are summed live, so every status recomputes on
+// the next read with no cached figure to invalidate.
+export async function setTxnAmount(env: Env, txnId: number, amount: number): Promise<void> {
+  await env.DB.prepare(`UPDATE transactions SET amount = ? WHERE id = ?`)
+    .bind(amount, txnId)
+    .run();
+}
+
 export async function setTxnCategory(
   env: Env,
   txnId: number,

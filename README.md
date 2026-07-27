@@ -56,9 +56,19 @@ mean:
 ```
 @budgetbot move the last $200 charge into yearly gift budget
 @budgetbot create a yearly gift budget of 1200
+@budgetbot change the last charge to $48.60
 @budgetbot how much did I spend on gifts this year?
 @budgetbot set my weekly budget to 400
 ```
+
+One message can carry several actions, and later ones can depend on earlier ones
+— *"create a yearly gift budget of 1200 and move the last $200 charge into it"*
+is planned as two steps and confirmed together. If any step is invalid, none of
+them run.
+
+Correcting an amount (`change the last charge to $48.60`) is for when the captured
+figure is wrong — bank alerts frequently land pre-tip. Budget totals are summed
+live, so every status recomputes on the next read.
 
 Anything that changes data shows a summary with **Yes / No** buttons and only
 applies on tap, so a misread amount can't silently move money.

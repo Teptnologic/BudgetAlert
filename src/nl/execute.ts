@@ -138,8 +138,13 @@ export async function applyApproved(env: Env, intents: Intent[]): Promise<string
   const reads = await readReplies(env, intents);
   if (reads) out += `\n\n${reads}`;
 
-  // A move changes what's left in the main budget, so show it.
-  if (intents.some((i) => i.action === "move_transaction" || i.action === "set_budget")) {
+  // Anything that shifts spend or the limit changes what's left, so show it.
+  const changesRemaining: Intent["action"][] = [
+    "move_transaction",
+    "set_transaction_amount",
+    "set_budget",
+  ];
+  if (intents.some((i) => changesRemaining.includes(i.action))) {
     out += `\n\n${await budgetStatusText(env)}`;
   }
   return out;
