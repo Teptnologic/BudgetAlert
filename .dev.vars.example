@@ -1,0 +1,9 @@
+# Copy to `.dev.vars` for local `wrangler dev`, and set the same values in
+# production with `wrangler secret put <NAME>`. Never commit real values.
+
+# From @BotFather when you create your Telegram bot.
+TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
+
+# A random string you choose. Telegram will send it in a header on every
+# webhook call so the Worker can reject forged requests.
+TELEGRAM_WEBHOOK_SECRET=choose-a-long-random-string

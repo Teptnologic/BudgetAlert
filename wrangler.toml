@@ -1,0 +1,23 @@
+name = "budgetalert"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Weekly summary — Monday 09:00 UTC. Adjust to your timezone/cadence.
+[triggers]
+crons = ["0 9 * * 1"]
+
+# D1 database. Create it with:  wrangler d1 create budgetalert
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "budgetalert"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Non-secret defaults. Secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET)
+# are set with `wrangler secret put <NAME>` — never commit them.
+[vars]
+WARN_PCT = "80"
+ALERT_PCT = "100"
+CURRENCY = "USD"
+BUDGET_PERIOD = "weekly"
