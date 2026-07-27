@@ -104,10 +104,13 @@ export const INTENT_SCHEMA = {
   properties: {
     actions: {
       type: "array",
-      minItems: 1,
-      maxItems: MAX_ACTIONS,
+      // No minItems/maxItems: structured outputs reject "complex array
+      // constraints", which fails the whole request. The bound is stated in the
+      // description for the model and enforced for real in normalizeBatch(),
+      // which caps the list and never returns it empty.
       description:
-        "The actions to take, in the order the user stated them. Usually exactly one. Use several only when the message genuinely asks for several things.",
+        `The actions to take, in the order the user stated them. Usually exactly one; ` +
+        `never more than ${MAX_ACTIONS}. Use several only when the message genuinely asks for several things.`,
       items: ACTION_SCHEMA,
     },
   },

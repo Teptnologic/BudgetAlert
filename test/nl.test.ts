@@ -48,11 +48,41 @@ describe("INTENT_SCHEMA complexity budget", () => {
     expect(nested).toEqual([]);
   });
 
-  it("wraps actions in a bounded array", () => {
+  it("wraps actions in an array", () => {
     const actions = INTENT_SCHEMA.properties.actions as any;
     expect(actions.type).toBe("array");
-    expect(actions.minItems).toBe(1);
-    expect(actions.maxItems).toBe(MAX_ACTIONS);
+    expect(actions.items).toBe(ACTION_ITEM_SCHEMA);
+  });
+
+  // Structured outputs reject unsupported constraints — array bounds, numeric
+  // ranges, string lengths — and the whole request 400s. The action cap is
+  // enforced in normalizeBatch() instead; see the normalizeBatch tests.
+  it("carries no constraint keywords structured outputs would reject", () => {
+    const banned = [
+      "minItems",
+      "maxItems",
+      "uniqueItems",
+      "minimum",
+      "maximum",
+      "exclusiveMinimum",
+      "exclusiveMaximum",
+      "multipleOf",
+      "minLength",
+      "maxLength",
+      "pattern",
+      "minProperties",
+      "maxProperties",
+    ];
+    const found: string[] = [];
+    const walk = (node: any, path: string) => {
+      if (!node || typeof node !== "object") return;
+      for (const [k, v] of Object.entries(node)) {
+        if (banned.includes(k)) found.push(`${path}.${k}`);
+        if (v && typeof v === "object") walk(v, `${path}.${k}`);
+      }
+    };
+    walk(INTENT_SCHEMA, "schema");
+    expect(found).toEqual([]);
   });
 
   it("forbids extra properties and requires every declared property", () => {

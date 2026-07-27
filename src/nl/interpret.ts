@@ -116,7 +116,25 @@ export async function interpret(
 
     return normalizeBatch(JSON.parse(text));
   } catch (err) {
-    console.error("interpret error:", err);
+    // Log the status and body — a bare "couldn't process that" tells neither
+    // the user nor `wrangler tail` anything actionable.
+    const status = (err as { status?: number })?.status;
+    console.error("interpret error:", status ?? "", (err as Error)?.message ?? err);
+
+    // Configuration faults are worth naming: they don't resolve by retrying,
+    // and only the operator can fix them.
+    if (status === 401 || status === 403) {
+      return [unknownIntent("My API key is being rejected — check ANTHROPIC_API_KEY.")];
+    }
+    if (status === 400) {
+      return [unknownIntent("The model rejected that request — see `wrangler tail` for details.")];
+    }
+    if (status === 429) {
+      return [unknownIntent("Rate limited just now — try again in a moment.")];
+    }
+    if (status === 404) {
+      return [unknownIntent(`Model "${env.NL_MODEL || DEFAULT_MODEL}" wasn't found — check NL_MODEL.`)];
+    }
     return [unknownIntent("I couldn't process that just now.")];
   }
 }
