@@ -201,30 +201,34 @@ export async function recentTransactions(env: Env, limit = 10): Promise<FullTxnR
 }
 
 // Locate one transaction for a move. Returns the newest match, or null.
+//
+// `excludeIds` skips rows already claimed by an earlier step of the same batch.
+// Without it, two "move the last charge" steps in one message both resolve to
+// the newest row and one of the moves is silently lost.
 export async function findTransaction(
   env: Env,
   kind: "last" | "amount" | "merchant",
   value: string | number,
+  excludeIds: number[] = [],
 ): Promise<FullTxnRow | null> {
+  // Ids are numbers we produced, never user text, so inlining them is safe —
+  // D1 has no variadic bind for IN lists.
+  const skip = excludeIds.length
+    ? ` AND id NOT IN (${excludeIds.map((n) => Number(n)).join(",")})`
+    : "";
+  const cols = `SELECT id, amount, merchant, occurred_at, category_id FROM transactions`;
+  const order = `ORDER BY occurred_at DESC, id DESC LIMIT 1`;
+
   if (kind === "last") {
-    return await env.DB.prepare(
-      `SELECT id, amount, merchant, occurred_at, category_id FROM transactions
-       ORDER BY occurred_at DESC, id DESC LIMIT 1`,
-    ).first<FullTxnRow>();
+    return await env.DB.prepare(`${cols} WHERE 1=1${skip} ${order}`).first<FullTxnRow>();
   }
   if (kind === "amount") {
     // Tolerate float representation drift rather than comparing for equality.
-    return await env.DB.prepare(
-      `SELECT id, amount, merchant, occurred_at, category_id FROM transactions
-       WHERE ABS(amount - ?) < 0.005 ORDER BY occurred_at DESC, id DESC LIMIT 1`,
-    )
+    return await env.DB.prepare(`${cols} WHERE ABS(amount - ?) < 0.005${skip} ${order}`)
       .bind(Number(value))
       .first<FullTxnRow>();
   }
-  return await env.DB.prepare(
-    `SELECT id, amount, merchant, occurred_at, category_id FROM transactions
-     WHERE merchant LIKE ? ORDER BY occurred_at DESC, id DESC LIMIT 1`,
-  )
+  return await env.DB.prepare(`${cols} WHERE merchant LIKE ?${skip} ${order}`)
     .bind(`%${String(value)}%`)
     .first<FullTxnRow>();
 }

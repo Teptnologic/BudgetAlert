@@ -1,19 +1,25 @@
 // Intent schema for natural-language messages.
 //
-// SHAPE NOTE (deliberate): this is one FLAT object with every field REQUIRED and
-// no `anyOf` / union types anywhere. The obvious modelling — a discriminated
-// union with one branch per action and optional per-branch fields — runs into
-// two API limits: at most 24 optional parameters, and at most 16 parameters
-// using `anyOf` or type arrays, per request. Exceeding the grammar's internal
-// limits fails the request with "Schema is too complex for compilation", which
-// would surface as a hard 400 on a user's message rather than at build time.
+// A message can carry SEVERAL ordered actions ("create a gift budget and move
+// the last $200 into it"), so the model returns { actions: [ ... ] }.
+//
+// SHAPE NOTE (deliberate): each action is one FLAT object with every field
+// REQUIRED and no `anyOf` / union types anywhere. The obvious modelling — a
+// discriminated union with one branch per action and optional per-branch fields
+// — runs into two API limits: at most 24 optional parameters, and at most 16
+// parameters using `anyOf` or type arrays, per request. Exceeding the grammar's
+// internal limits fails the request with "Schema is too complex for
+// compilation", which would surface as a hard 400 on a user's message rather
+// than at build time.
 //
 // So: irrelevant fields carry sentinels ("" / 0 / "none") instead of being
 // absent or null, and normalizeIntent() below turns that back into a typed
 // discriminated union for the rest of the app. Current counts, keep them low:
-//   required params: 10   optional: 0   anyOf/type-array params: 0
+//   required params: 11 (1 wrapper + 10 item)   optional: 0   anyOf/type-array: 0
 
-export const INTENT_SCHEMA = {
+export const MAX_ACTIONS = 5;
+
+const ACTION_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: [
@@ -91,6 +97,26 @@ export const INTENT_SCHEMA = {
   },
 } as const;
 
+export const INTENT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["actions"],
+  properties: {
+    actions: {
+      type: "array",
+      minItems: 1,
+      maxItems: MAX_ACTIONS,
+      description:
+        "The actions to take, in the order the user stated them. Usually exactly one. Use several only when the message genuinely asks for several things.",
+      items: ACTION_SCHEMA,
+    },
+  },
+} as const;
+
+// Exported for the schema-complexity tests, which count parameters across the
+// wrapper and the item to keep the request inside the grammar's limits.
+export const ACTION_ITEM_SCHEMA = ACTION_SCHEMA;
+
 export type Action =
   | "get_status"
   | "query_spend"
@@ -131,10 +157,10 @@ export function isMutating(action: Action): boolean {
   return MUTATING.has(action);
 }
 
-const ACTIONS = new Set(INTENT_SCHEMA.properties.action.enum as readonly string[]);
-const PERIODS = new Set(INTENT_SCHEMA.properties.period.enum as readonly string[]);
-const WINDOWS = new Set(INTENT_SCHEMA.properties.window.enum as readonly string[]);
-const SELECTORS = new Set(INTENT_SCHEMA.properties.selector_kind.enum as readonly string[]);
+const ACTIONS = new Set(ACTION_SCHEMA.properties.action.enum as readonly string[]);
+const PERIODS = new Set(ACTION_SCHEMA.properties.period.enum as readonly string[]);
+const WINDOWS = new Set(ACTION_SCHEMA.properties.window.enum as readonly string[]);
+const SELECTORS = new Set(ACTION_SCHEMA.properties.selector_kind.enum as readonly string[]);
 
 // Structured outputs constrain which enum value is chosen but NOT its
 // capitalization, so every enum comparison here is case-insensitive. Anything
@@ -154,18 +180,25 @@ function num(raw: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-// Turn a raw model response into a trusted Intent. Never throws.
+// Turn a raw intent into a trusted Intent. Never throws.
+//
+// Accepts BOTH key styles, and must keep doing so: the model emits the schema's
+// snake_case (`selector_kind`), while an intent staged in `pending_actions` was
+// serialized from an already-normalized Intent and comes back camelCase
+// (`selectorKind`). Reading only snake_case silently drops those fields on the
+// round trip, which turns every confirmed move into "no longer valid".
 export function normalizeIntent(raw: unknown): Intent {
   const o = (raw ?? {}) as Record<string, unknown>;
+  const either = (snake: string, camel: string): unknown => o[snake] ?? o[camel];
   return {
     action: pickEnum<Action>(o.action, ACTIONS, "unknown"),
     category: str(o.category).toLowerCase(),
-    categoryLabel: str(o.category_label),
+    categoryLabel: str(either("category_label", "categoryLabel")),
     amount: Math.abs(num(o.amount)),
     period: pickEnum<PeriodOrNone>(o.period, PERIODS, "none"),
     window: pickEnum<Window>(o.window, WINDOWS, "none"),
-    selectorKind: pickEnum<SelectorKind>(o.selector_kind, SELECTORS, "none"),
-    selectorValue: str(o.selector_value),
+    selectorKind: pickEnum<SelectorKind>(either("selector_kind", "selectorKind"), SELECTORS, "none"),
+    selectorValue: str(either("selector_value", "selectorValue")),
     limit: Math.min(20, Math.max(0, Math.trunc(num(o.limit)))),
     reason: str(o.reason),
   };
@@ -173,4 +206,30 @@ export function normalizeIntent(raw: unknown): Intent {
 
 export function unknownIntent(reason: string): Intent {
   return normalizeIntent({ action: "unknown", reason });
+}
+
+// Turn a raw model response into an ordered list of trusted Intents.
+// Never throws and never returns an empty array — callers can always assume at
+// least one step, so "nothing to do" is expressed as a single `unknown`.
+//
+// Also accepts a bare action object: pending_actions rows written before this
+// change stored a single intent, and one could still be mid-flight at deploy.
+export function normalizeBatch(raw: unknown): Intent[] {
+  const source =
+    raw && typeof raw === "object" && Array.isArray((raw as { actions?: unknown }).actions)
+      ? (raw as { actions: unknown[] }).actions
+      : Array.isArray(raw)
+        ? raw
+        : raw && typeof raw === "object"
+          ? [raw] // legacy single-intent shape
+          : [];
+
+  const intents = source.slice(0, MAX_ACTIONS).map(normalizeIntent);
+  if (!intents.length) return [unknownIntent("I didn't get anything I could act on.")];
+  return intents;
+}
+
+// A batch needs confirmation when any step writes.
+export function batchMutates(intents: Intent[]): boolean {
+  return intents.some((i) => isMutating(i.action));
 }

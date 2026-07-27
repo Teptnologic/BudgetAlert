@@ -28,8 +28,8 @@ import { sendMessage, answerCallback, editMessage } from "../notify/telegram";
 import { formatMoney } from "../core/engine";
 import { isPeriod, periodStart } from "../core/period";
 import { interpret } from "../nl/interpret";
-import { execute, applyMutation } from "../nl/execute";
-import { normalizeIntent } from "../nl/schema";
+import { executeBatch, applyApproved } from "../nl/execute";
+import { normalizeBatch } from "../nl/schema";
 
 interface TgUpdate {
   message?: {
@@ -95,7 +95,7 @@ async function handleNaturalLanguage(env: Env, chat: string, text: string): Prom
     recentTransactions(env, 10),
   ]);
 
-  const intent = await interpret(env, text, {
+  const intents = await interpret(env, text, {
     currency: cfg.currency,
     categories: categories.map((c) => ({
       name: c.name,
@@ -110,10 +110,10 @@ async function handleNaturalLanguage(env: Env, chat: string, text: string): Prom
     })),
   });
 
-  const reply = await execute(env, intent);
+  const reply = await executeBatch(env, intents);
 
   if (reply.confirmToken) {
-    await savePending(env, reply.confirmToken, chat, JSON.stringify(intent), reply.text);
+    await savePending(env, reply.confirmToken, chat, JSON.stringify(intents), reply.text);
   }
   await sendMessage(env, chat, reply.text, reply.confirmToken);
 }
@@ -152,8 +152,8 @@ async function handleCallback(update: TgUpdate, env: Env): Promise<void> {
 
   await answerCallback(env, cb.id, "Working…");
   try {
-    const intent = normalizeIntent(JSON.parse(pending.intent));
-    const result = await applyMutation(env, intent);
+    const intents = normalizeBatch(JSON.parse(pending.intent));
+    const result = await applyApproved(env, intents);
     await editMessage(env, chat, messageId, result);
   } catch (err) {
     console.error("callback apply error:", err);

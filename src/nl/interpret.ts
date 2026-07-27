@@ -5,7 +5,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { Env } from "../env";
-import { INTENT_SCHEMA, normalizeIntent, unknownIntent, type Intent } from "./schema";
+import { INTENT_SCHEMA, MAX_ACTIONS, normalizeBatch, unknownIntent, type Intent } from "./schema";
 
 // Sonnet 5 is the default rather than Opus 5: this is a bounded extraction task
 // on a latency-sensitive webhook path, and compiled grammars are cached for 24h
@@ -57,8 +57,17 @@ function systemPrompt(ctx: InterpretContext): string {
     "- Fields that do not apply take their empty value: \"\" for text, 0 for numbers,",
     "  'none' for period/window/selector_kind.",
     "- If the message is ambiguous, off-topic, or you would have to guess at an amount",
-    "  or a category, return action 'unknown' with a short reason. Guessing moves the",
-    "  user's money to the wrong place; asking is always cheaper.",
+    "  or a category, return a single action 'unknown' with a short reason. Guessing moves",
+    "  the user's money to the wrong place; asking is always cheaper.",
+    "",
+    "Multiple actions:",
+    `- Return one action per distinct thing the user asked for, at most ${MAX_ACTIONS},`,
+    "  in the order they said them. Most messages are a single action.",
+    "- A later action may depend on an earlier one. 'create a yearly gift budget of 1200",
+    "  and move the last $200 charge into it' is exactly two actions: create_category",
+    "  then move_transaction, both with category 'gift'. Do not drop either half.",
+    "- Do not invent steps the user did not ask for, and do not split one request into",
+    "  several. When in doubt, prefer a single 'unknown' over a speculative multi-step plan.",
   ].join("\n");
 }
 
@@ -66,9 +75,9 @@ export async function interpret(
   env: Env,
   message: string,
   ctx: InterpretContext,
-): Promise<Intent> {
+): Promise<Intent[]> {
   if (!env.ANTHROPIC_API_KEY) {
-    return unknownIntent("Natural language is not configured (no API key set).");
+    return [unknownIntent("Natural language is not configured (no API key set).")];
   }
 
   const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
@@ -91,23 +100,23 @@ export async function interpret(
 
     // Safety classifiers can decline: HTTP 200 with an empty/partial content array.
     if (response.stop_reason === "refusal") {
-      return unknownIntent("That request was declined.");
+      return [unknownIntent("That request was declined.")];
     }
     // Truncation leaves invalid JSON. Treat it as a miss rather than parsing junk.
     if (response.stop_reason === "max_tokens") {
       console.error("interpret: response truncated at max_tokens");
-      return unknownIntent("That took too long to work out — try rephrasing more simply.");
+      return [unknownIntent("That took too long to work out — try rephrasing more simply.")];
     }
 
     const text = response.content
       .filter((b): b is Anthropic.TextBlock => b.type === "text")
       .map((b) => b.text)
       .join("");
-    if (!text.trim()) return unknownIntent("I got an empty response — try rephrasing.");
+    if (!text.trim()) return [unknownIntent("I got an empty response — try rephrasing.")];
 
-    return normalizeIntent(JSON.parse(text));
+    return normalizeBatch(JSON.parse(text));
   } catch (err) {
     console.error("interpret error:", err);
-    return unknownIntent("I couldn't process that just now.");
+    return [unknownIntent("I couldn't process that just now.")];
   }
 }

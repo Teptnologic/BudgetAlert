@@ -1,40 +1,136 @@
 import { describe, it, expect } from "vitest";
-import { INTENT_SCHEMA, normalizeIntent, isMutating, unknownIntent } from "../src/nl/schema";
+import {
+  INTENT_SCHEMA,
+  ACTION_ITEM_SCHEMA,
+  MAX_ACTIONS,
+  normalizeIntent,
+  normalizeBatch,
+  batchMutates,
+  isMutating,
+  unknownIntent,
+} from "../src/nl/schema";
+import { planBatch } from "../src/nl/plan";
+import { executeBatch } from "../src/nl/execute";
 import { periodStart, periodLabel, isPeriod } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
 // `anyOf` or type arrays; exceeding the grammar's limits fails with
 // "Schema is too complex for compilation" — a 400 on a user's message rather
-// than a build error. These tests fail the build instead, so a future branch
-// added to the schema can't quietly push it over.
+// than a build error. These tests fail the build instead, so a future field
+// added to the schema can't quietly push it over. Counts span the wrapper and
+// the array item, since the grammar is compiled from the whole request.
 describe("INTENT_SCHEMA complexity budget", () => {
-  const props = Object.entries(INTENT_SCHEMA.properties as Record<string, any>);
-  const required = new Set(INTENT_SCHEMA.required as readonly string[]);
+  const wrapperProps = Object.entries(INTENT_SCHEMA.properties as Record<string, any>);
+  const itemProps = Object.entries(ACTION_ITEM_SCHEMA.properties as Record<string, any>);
+  const allProps = [...wrapperProps, ...itemProps];
+  const wrapperRequired = new Set(INTENT_SCHEMA.required as readonly string[]);
+  const itemRequired = new Set(ACTION_ITEM_SCHEMA.required as readonly string[]);
 
   it("has no optional parameters", () => {
-    const optional = props.filter(([name]) => !required.has(name)).map(([n]) => n);
+    const optional = [
+      ...wrapperProps.filter(([n]) => !wrapperRequired.has(n)).map(([n]) => n),
+      ...itemProps.filter(([n]) => !itemRequired.has(n)).map(([n]) => n),
+    ];
     expect(optional).toEqual([]);
     expect(optional.length).toBeLessThanOrEqual(24);
   });
 
   it("uses no anyOf or type arrays", () => {
-    const unions = props.filter(
-      ([, spec]) => "anyOf" in spec || Array.isArray(spec.type),
-    );
+    const unions = allProps.filter(([, spec]) => "anyOf" in spec || Array.isArray(spec.type));
     expect(unions).toEqual([]);
     expect(unions.length).toBeLessThanOrEqual(16);
   });
 
-  it("is flat — no nested object or array properties", () => {
-    const nested = props
+  it("keeps the action item flat — no nested objects or arrays", () => {
+    const nested = itemProps
       .filter(([, spec]) => spec.type === "object" || spec.type === "array")
       .map(([n]) => n);
     expect(nested).toEqual([]);
   });
 
+  it("wraps actions in a bounded array", () => {
+    const actions = INTENT_SCHEMA.properties.actions as any;
+    expect(actions.type).toBe("array");
+    expect(actions.minItems).toBe(1);
+    expect(actions.maxItems).toBe(MAX_ACTIONS);
+  });
+
   it("forbids extra properties and requires every declared property", () => {
     expect(INTENT_SCHEMA.additionalProperties).toBe(false);
-    expect(required.size).toBe(props.length);
+    expect(ACTION_ITEM_SCHEMA.additionalProperties).toBe(false);
+    expect(wrapperRequired.size).toBe(wrapperProps.length);
+    expect(itemRequired.size).toBe(itemProps.length);
+  });
+});
+
+describe("normalizeBatch", () => {
+  it("reads the actions array", () => {
+    const b = normalizeBatch({
+      actions: [{ action: "create_category", category: "gift" }, { action: "get_status" }],
+    });
+    expect(b).toHaveLength(2);
+    expect(b[0].action).toBe("create_category");
+    expect(b[1].action).toBe("get_status");
+  });
+
+  it("preserves the stated order", () => {
+    const b = normalizeBatch({
+      actions: [{ action: "create_category" }, { action: "move_transaction" }],
+    });
+    expect(b.map((i) => i.action)).toEqual(["create_category", "move_transaction"]);
+  });
+
+  // pending_actions rows written before batching stored a single intent object.
+  it("accepts a legacy bare intent object", () => {
+    const b = normalizeBatch({ action: "set_budget", amount: 400 });
+    expect(b).toHaveLength(1);
+    expect(b[0].action).toBe("set_budget");
+    expect(b[0].amount).toBe(400);
+  });
+
+  it("accepts a bare array", () => {
+    expect(normalizeBatch([{ action: "get_status" }])).toHaveLength(1);
+  });
+
+  it(`caps at ${MAX_ACTIONS} actions`, () => {
+    const many = Array.from({ length: 12 }, () => ({ action: "get_status" }));
+    expect(normalizeBatch({ actions: many })).toHaveLength(MAX_ACTIONS);
+  });
+
+  it("never returns empty — callers always get at least one step", () => {
+    for (const bad of [null, undefined, {}, { actions: [] }, [], "nonsense", 42]) {
+      const b = normalizeBatch(bad);
+      expect(b.length).toBeGreaterThanOrEqual(1);
+      expect(b[0].action).toBe("unknown");
+    }
+  });
+
+  it("degrades a bad step inside a good batch to unknown", () => {
+    const b = normalizeBatch({
+      actions: [{ action: "get_status" }, { action: "drop_all_tables" }],
+    });
+    expect(b[0].action).toBe("get_status");
+    expect(b[1].action).toBe("unknown");
+  });
+});
+
+describe("batchMutates", () => {
+  it("is true when any step writes", () => {
+    expect(
+      batchMutates(normalizeBatch({ actions: [{ action: "get_status" }, { action: "set_budget" }] })),
+    ).toBe(true);
+  });
+
+  it("is false for a read-only batch", () => {
+    expect(
+      batchMutates(
+        normalizeBatch({ actions: [{ action: "get_status" }, { action: "list_recent" }] }),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false for an unparseable message", () => {
+    expect(batchMutates(normalizeBatch(null))).toBe(false);
   });
 });
 
@@ -102,6 +198,35 @@ describe("normalizeIntent", () => {
   it("trims whitespace from text fields", () => {
     expect(normalizeIntent({ category: "  gift  " }).category).toBe("gift");
   });
+
+  // Regression: an intent staged in pending_actions is serialized from an
+  // already-normalized Intent, so it comes back camelCase. Reading only the
+  // model's snake_case dropped selectorKind/categoryLabel on the round trip and
+  // turned every confirmed move into "no longer valid".
+  it("survives a storage round trip with its camelCase keys intact", () => {
+    const fromModel = normalizeIntent({
+      action: "move_transaction",
+      category: "gift",
+      category_label: "Yearly gift budget",
+      selector_kind: "merchant",
+      selector_value: "TOP GOLF",
+    });
+    const roundTripped = normalizeIntent(JSON.parse(JSON.stringify(fromModel)));
+    expect(roundTripped).toEqual(fromModel);
+    expect(roundTripped.selectorKind).toBe("merchant");
+    expect(roundTripped.selectorValue).toBe("TOP GOLF");
+    expect(roundTripped.categoryLabel).toBe("Yearly gift budget");
+  });
+
+  it("round trips a whole batch through storage", () => {
+    const batch = normalizeBatch({
+      actions: [
+        { action: "create_category", category: "gift", category_label: "Gift", amount: 1200, period: "yearly" },
+        { action: "move_transaction", category: "gift", selector_kind: "last" },
+      ],
+    });
+    expect(normalizeBatch(JSON.parse(JSON.stringify(batch)))).toEqual(batch);
+  });
 });
 
 describe("isMutating", () => {
@@ -116,6 +241,196 @@ describe("isMutating", () => {
 
   it("treats an unparseable message as a non-mutating unknown", () => {
     expect(isMutating(unknownIntent("nope").action)).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------- projection */
+
+// Minimal D1 stub: dispatches on the SQL text so planBatch/executeBatch can run
+// offline. Exercises the real projection logic, which is the point of batching.
+function fakeEnv(opts: {
+  categories?: { id: number; name: string; label: string; amount: number; period: string }[];
+  transactions?: { id: number; amount: number; merchant: string | null }[];
+}): any {
+  const cats = opts.categories ?? [];
+  const txns = opts.transactions ?? []; // newest first
+  const cfg = {
+    budget_amount: 500,
+    currency: "USD",
+    period: "weekly",
+    warn_pct: 80,
+    alert_pct: 100,
+    group_chat_id: "1",
+  };
+
+  const DB = {
+    prepare(sql: string) {
+      let binds: any[] = [];
+      const api: any = {
+        bind(...args: any[]) {
+          binds = args;
+          return api;
+        },
+        async first() {
+          if (sql.includes("FROM config")) return cfg;
+          if (sql.includes("FROM categories")) {
+            return cats.find((c) => c.name === binds[0]) ?? null;
+          }
+          if (sql.includes("FROM transactions")) {
+            const m = sql.match(/id NOT IN \(([^)]*)\)/);
+            const excluded = m ? m[1].split(",").map(Number) : [];
+            let pool = txns.filter((t) => !excluded.includes(t.id));
+            if (sql.includes("ABS(amount")) {
+              pool = pool.filter((t) => Math.abs(t.amount - Number(binds[0])) < 0.005);
+            }
+            if (sql.includes("merchant LIKE")) {
+              const needle = String(binds[0]).replace(/%/g, "").toLowerCase();
+              pool = pool.filter((t) => (t.merchant ?? "").toLowerCase().includes(needle));
+            }
+            return pool[0] ?? null;
+          }
+          return null;
+        },
+        async all() {
+          return { results: sql.includes("FROM categories") ? cats : [] };
+        },
+        async run() {
+          return { meta: { changes: 1 } };
+        },
+      };
+      return api;
+    },
+  };
+  return { DB };
+}
+
+describe("planBatch projection", () => {
+  const txns = [
+    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA" },
+    { id: 8, amount: 84, merchant: "STARBUCKS" },
+  ];
+
+  // The case that motivates the whole feature: step 2 must validate against a
+  // world where step 1 already ran.
+  it("lets a move depend on a category created earlier in the same batch", async () => {
+    const env = fakeEnv({ transactions: txns });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "create_category", category: "gift", category_label: "Gift", amount: 1200, period: "yearly" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("Create");
+    expect(steps[1].text).toContain("TOP GOLF BAY RESERVA");
+  });
+
+  it("rejects a move into a category that no step creates", async () => {
+    const env = fakeEnv({ transactions: txns });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({ actions: [{ action: "move_transaction", category: "gift", selector_kind: "last" }] }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].text).toContain("No budget called");
+  });
+
+  // Without claimedTxnIds both steps resolve to the newest row and one move is
+  // silently lost.
+  it("does not resolve two 'last charge' steps to the same transaction", async () => {
+    const env = fakeEnv({
+      categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+      transactions: txns,
+    });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("TOP GOLF BAY RESERVA");
+    expect(steps[1].text).toContain("STARBUCKS");
+  });
+
+  it("reports the step that has no matching transaction", async () => {
+    const env = fakeEnv({
+      categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+      transactions: txns,
+    });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [{ action: "move_transaction", category: "gift", selector_kind: "amount", amount: 999 }],
+      }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].text).toContain("No transaction");
+  });
+});
+
+describe("executeBatch", () => {
+  const env = () =>
+    fakeEnv({
+      categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+      transactions: [{ id: 9, amount: 200, merchant: "TOP GOLF" }],
+    });
+
+  it("offers a confirmation for a valid batch", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({ actions: [{ action: "move_transaction", category: "gift", selector_kind: "last" }] }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("TOP GOLF");
+  });
+
+  // Validate upfront: one broken step blocks everything, so a partly understood
+  // message never half-applies.
+  it("blocks the whole batch when any step is invalid", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({
+        actions: [
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+          { action: "move_transaction", category: "nope", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(reply.confirmToken).toBeUndefined();
+    expect(reply.text).toContain("haven't done any of it");
+  });
+
+  it("numbers a multi-step plan", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({
+        actions: [
+          { action: "set_budget", amount: 400 },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("I'll do 2 things:");
+    expect(reply.text).toContain("1.");
+    expect(reply.text).toContain("2.");
+  });
+
+  // Regression: a single action should still read as one line, not a list of one.
+  it("keeps a single action as a one-line question", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({ actions: [{ action: "set_budget", amount: 400 }] }),
+    );
+    expect(reply.text).not.toContain("1.");
+    expect(reply.text.trim().endsWith("?")).toBe(true);
   });
 });
 

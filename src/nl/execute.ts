@@ -1,27 +1,15 @@
-// Maps a normalized Intent onto typed handlers. This is the only place that
-// writes data on behalf of a natural-language message; the model never gets
-// near D1. Read intents answer immediately, mutating intents are staged behind
-// a Yes/No confirmation.
+// Orchestrates a batch of intents: answers reads, and stages writes behind a
+// single confirmation. This is the only place that acts on a natural-language
+// message; the model never gets near D1.
 
 import type { Env } from "../env";
 import type { Intent } from "./schema";
-import { isMutating } from "./schema";
+import { isMutating, batchMutates } from "./schema";
+import { planBatch, applyBatch, type StepOutcome } from "./plan";
 import { isPeriod, periodStart, periodLabel, daysAgo, type Period } from "../core/period";
 import { formatMoney } from "../core/engine";
 import { budgetStatusText } from "../service";
-import {
-  getConfig,
-  setBudget,
-  setPeriod,
-  listCategories,
-  findCategory,
-  upsertCategory,
-  setCategoryBudget,
-  recentTransactions,
-  findTransaction,
-  setTxnCategory,
-  sumSince,
-} from "../store/d1";
+import { getConfig, listCategories, findCategory, recentTransactions, sumSince } from "../store/d1";
 
 export interface Reply {
   text: string;
@@ -34,7 +22,7 @@ function esc(s: string): string {
 }
 
 function token(): string {
-  // Short + opaque: Telegram caps callback_data at 64 bytes, so the intent is
+  // Short + opaque: Telegram caps callback_data at 64 bytes, so the batch is
   // stored server-side and only this key travels in the button.
   return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 }
@@ -49,7 +37,7 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
       if (!intent.category) return await budgetStatusText(env);
       const cat = await findCategory(env, intent.category);
       if (!cat) return `I don't have a budget called <b>${esc(intent.category)}</b> yet.`;
-      const period = isPeriod(cat.period) ? cat.period : "yearly";
+      const period: Period = isPeriod(cat.period) ? cat.period : "yearly";
       const start = periodStart(period);
       const spent = await sumSince(env, start.toISOString(), cat.id);
       const remaining = cat.amount - spent;
@@ -89,131 +77,70 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
   }
 }
 
-/* ------------------------------------------------- mutations: summarize first */
-
-// Render what the action WOULD do, so the user confirms against real values
-// (resolved merchant, resolved category) rather than against their own phrasing.
-async function describeMutation(env: Env, intent: Intent): Promise<string | null> {
-  const cfg = await getConfig(env);
-
-  switch (intent.action) {
-    case "move_transaction": {
-      if (intent.selectorKind === "none") return null;
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value);
-      if (!txn) return null;
-      if (!intent.category) return null;
-      const cat = await findCategory(env, intent.category);
-      if (!cat) {
-        return (
-          `I don't have a budget called <b>${esc(intent.category)}</b> yet. ` +
-          `Create it first, e.g. "create a yearly ${esc(intent.category)} budget of 1200".`
-        );
-      }
-      return (
-        `Move ${formatMoney(txn.amount, cfg.currency)} — ` +
-        `${esc(txn.merchant ?? "unknown")} → <b>${esc(cat.label)}</b>?`
-      );
-    }
-
-    case "set_budget": {
-      if (intent.amount <= 0) return null;
-      if (intent.category) {
-        const cat = await findCategory(env, intent.category);
-        if (!cat) return null;
-        return `Set <b>${esc(cat.label)}</b> budget to ${formatMoney(intent.amount, cfg.currency)}?`;
-      }
-      return `Set your main budget to ${formatMoney(intent.amount, cfg.currency)}?`;
-    }
-
-    case "create_category": {
-      if (!intent.category) return null;
-      const period = intent.period === "none" ? "yearly" : intent.period;
-      const label = intent.categoryLabel || intent.category;
-      return (
-        `Create budget <b>${esc(label)}</b> — ` +
-        `${formatMoney(intent.amount, cfg.currency)} per ${period}?`
-      );
-    }
-
-    case "set_period":
-      if (intent.period === "none") return null;
-      return `Set your main budget window to <b>${intent.period}</b>?`;
-
-    default:
-      return null;
+async function readReplies(env: Env, intents: Intent[]): Promise<string> {
+  const out: string[] = [];
+  for (const intent of intents) {
+    if (!isMutating(intent.action)) out.push(await readReply(env, intent));
   }
-}
-
-// Apply a previously-confirmed mutation. Re-resolves everything from the intent
-// rather than trusting anything cached at describe time.
-export async function applyMutation(env: Env, intent: Intent): Promise<string> {
-  const cfg = await getConfig(env);
-
-  switch (intent.action) {
-    case "move_transaction": {
-      if (intent.selectorKind === "none" || !intent.category) return "That move is no longer valid.";
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value);
-      const cat = await findCategory(env, intent.category);
-      if (!txn || !cat) return "That move is no longer valid.";
-      await setTxnCategory(env, txn.id, cat.id);
-      return (
-        `✅ Moved ${formatMoney(txn.amount, cfg.currency)} — ` +
-        `${esc(txn.merchant ?? "unknown")} → <b>${esc(cat.label)}</b>.\n\n` +
-        (await budgetStatusText(env))
-      );
-    }
-
-    case "set_budget": {
-      if (intent.category) {
-        const cat = await findCategory(env, intent.category);
-        if (!cat) return "That budget no longer exists.";
-        await setCategoryBudget(env, cat.id, intent.amount);
-        return `✅ <b>${esc(cat.label)}</b> budget set to ${formatMoney(intent.amount, cfg.currency)}.`;
-      }
-      await setBudget(env, intent.amount);
-      return `✅ Main budget set to <b>${formatMoney(intent.amount, cfg.currency)}</b>.`;
-    }
-
-    case "create_category": {
-      const period = intent.period === "none" ? "yearly" : intent.period;
-      const label = intent.categoryLabel || intent.category;
-      await upsertCategory(env, intent.category, label, intent.amount, period);
-      return (
-        `✅ Created <b>${esc(label)}</b> — ` +
-        `${formatMoney(intent.amount, cfg.currency)} per ${period}.`
-      );
-    }
-
-    case "set_period": {
-      if (intent.period === "none") return "That change is no longer valid.";
-      await setPeriod(env, intent.period as Period);
-      return `✅ Budget window set to <b>${intent.period}</b>.`;
-    }
-
-    default:
-      return "Nothing to do.";
-  }
+  return out.join("\n\n");
 }
 
 /* ------------------------------------------------------------------ entry */
 
-export async function execute(env: Env, intent: Intent): Promise<Reply> {
-  if (!isMutating(intent.action)) {
-    return { text: await readReply(env, intent) };
+function numbered(items: string[]): string {
+  return items.map((t, i) => `${i + 1}. ${t}`).join("\n");
+}
+
+// Plan a batch and either answer it (reads only) or stage it for confirmation.
+export async function executeBatch(env: Env, intents: Intent[]): Promise<Reply> {
+  if (!batchMutates(intents)) {
+    return { text: await readReplies(env, intents) };
   }
 
-  const summary = await describeMutation(env, intent);
-  if (!summary) {
-    return {
-      text: "I understood roughly what you meant but couldn't pin down the details. Try naming the amount and the budget explicitly.",
-    };
-  }
-  // describeMutation returns guidance (not a question) when it wants to bail out
-  // early — e.g. the target category doesn't exist yet. Nothing to confirm.
-  if (!summary.endsWith("?")) return { text: summary };
+  const steps = await planBatch(env, intents);
+  const bad = steps.filter((s) => !s.ok);
 
-  const t = token();
-  return { text: summary, confirmToken: t };
+  // Validate upfront: one broken step blocks the whole batch, so a partially
+  // understood message never half-applies.
+  if (bad.length) {
+    const header =
+      steps.length === 1
+        ? "I couldn't do that:"
+        : "I couldn't do all of that, so I haven't done any of it:";
+    return { text: `${header}\n${numbered(steps.map((s) => s.text))}` };
+  }
+
+  const body =
+    steps.length === 1
+      ? `${steps[0].text}?`
+      : `I'll do ${steps.length} things:\n${numbered(steps.map((s) => s.text))}`;
+
+  return { text: body, confirmToken: token() };
+}
+
+// Run an approved batch: writes first, then reads so their answers reflect the
+// new state.
+export async function applyApproved(env: Env, intents: Intent[]): Promise<string> {
+  const outcomes: StepOutcome[] = await applyBatch(env, intents);
+  const failed = outcomes.filter((o) => !o.ok).length;
+
+  let out: string;
+  if (outcomes.length === 1) {
+    out = `${outcomes[0].ok ? "✅" : "❌"} ${outcomes[0].text}.`;
+  } else {
+    const lines = outcomes.map((o) => `${o.ok ? "✅" : "❌"} ${o.text}`);
+    out = numbered(lines);
+    if (failed) {
+      out += `\n\n⚠️ ${failed} of ${outcomes.length} steps didn't apply — the rest did.`;
+    }
+  }
+
+  const reads = await readReplies(env, intents);
+  if (reads) out += `\n\n${reads}`;
+
+  // A move changes what's left in the main budget, so show it.
+  if (intents.some((i) => i.action === "move_transaction" || i.action === "set_budget")) {
+    out += `\n\n${await budgetStatusText(env)}`;
+  }
+  return out;
 }
