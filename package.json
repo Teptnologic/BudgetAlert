@@ -16,10 +16,10 @@
     "db:migrate:local": "wrangler d1 execute budgetalert --local --file=./migrations/002_categories.sql"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240909.0",
+    "@cloudflare/workers-types": "^5.20260721.1",
     "typescript": "^5.5.4",
     "vitest": "^2.0.5",
-    "wrangler": "^3.72.0"
+    "wrangler": "^4.112.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
