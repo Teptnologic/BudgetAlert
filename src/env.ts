@@ -6,6 +6,11 @@ export interface Env {
   DB: D1Database;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  TELEGRAM_BOT_USERNAME?: string;
+  // Natural-language layer. Without a key the bot still works — slash commands
+  // are unaffected and @mentions reply asking you to use them.
+  ANTHROPIC_API_KEY?: string;
+  NL_MODEL?: string;
   WARN_PCT?: string;
   ALERT_PCT?: string;
   CURRENCY?: string;

@@ -4,7 +4,7 @@
 import type { Env } from "./env";
 import type { ParsedTxn } from "./core/parser";
 import type { Period } from "./core/period";
-import { periodStart, periodLabel, daysAgo } from "./core/period";
+import { periodStart, periodLabel, daysAgo, isPeriod } from "./core/period";
 import {
   computeStatus,
   alertsToFire,
@@ -18,6 +18,7 @@ import {
   listSince,
   getSentAlerts,
   markAlertSent,
+  listCategories,
 } from "./store/d1";
 import { sendMessage } from "./notify/telegram";
 
@@ -72,22 +73,40 @@ export async function recordAndEvaluate(
 }
 
 // Human-readable current status — used by the on-demand `/status` command.
+// Shows the default envelope, then one line per category budget.
 export async function budgetStatusText(env: Env): Promise<string> {
   const cfg = await getConfig(env);
   if (cfg.budget_amount <= 0) {
     return "No budget set yet. Send <code>/budget 500</code> to set one.";
   }
   const start = periodStart(cfg.period as Period);
+  // Uncategorized spend only — categorized charges belong to their own envelope.
   const spent = await sumSince(env, start.toISOString());
   const status = computeStatus(cfg.budget_amount, spent, cfg.currency);
   const label = periodLabel(cfg.period as Period, start);
   const bar = progressBar(status.pct);
-  return (
+
+  let out =
     `<b>Budget — ${label}</b>\n` +
     `${bar} ${status.pct.toFixed(0)}%\n` +
     `Spent: ${formatMoney(status.spent, status.currency)} of ${formatMoney(status.budget, status.currency)}\n` +
-    `Remaining: <b>${formatMoney(status.remaining, status.currency)}</b>`
-  );
+    `Remaining: <b>${formatMoney(status.remaining, status.currency)}</b>`;
+
+  const cats = await listCategories(env);
+  if (cats.length) {
+    const lines: string[] = [];
+    for (const c of cats) {
+      const p: Period = isPeriod(c.period) ? c.period : "yearly";
+      const cSpent = await sumSince(env, periodStart(p).toISOString(), c.id);
+      const remaining = c.amount - cSpent;
+      lines.push(
+        `• ${c.label}: ${formatMoney(cSpent, cfg.currency)} of ` +
+          `${formatMoney(c.amount, cfg.currency)} — ${formatMoney(remaining, cfg.currency)} left`,
+      );
+    }
+    out += `\n\n<b>Other envelopes</b>\n${lines.join("\n")}`;
+  }
+  return out;
 }
 
 // Weekly digest: last 7 days of spend + progress toward the budget period.

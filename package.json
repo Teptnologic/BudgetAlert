@@ -11,7 +11,9 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "db:init": "wrangler d1 execute budgetalert --remote --file=./schema.sql",
-    "db:init:local": "wrangler d1 execute budgetalert --local --file=./schema.sql"
+    "db:init:local": "wrangler d1 execute budgetalert --local --file=./schema.sql",
+    "db:migrate": "wrangler d1 execute budgetalert --remote --file=./migrations/002_categories.sql",
+    "db:migrate:local": "wrangler d1 execute budgetalert --local --file=./migrations/002_categories.sql"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",
@@ -20,6 +22,7 @@
     "wrangler": "^3.72.0"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "postal-mime": "^2.2.7"
   }
 }

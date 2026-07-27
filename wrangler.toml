@@ -21,3 +21,11 @@ WARN_PCT = "80"
 ALERT_PCT = "100"
 CURRENCY = "USD"
 BUDGET_PERIOD = "weekly"
+# Your bot's @handle without the @, e.g. "budgetalert_bot". Required for the
+# natural-language path — it's how the Worker knows it was addressed.
+TELEGRAM_BOT_USERNAME = "REPLACE_WITH_YOUR_BOT_USERNAME"
+# Model for parsing natural-language messages. Sonnet 5 is a deliberate default
+# over Opus 5: bounded extraction on a latency-sensitive webhook, and compiled
+# grammars are cached only ~24h from last use, so a low-traffic bot would often
+# pay compile latency on Opus for no accuracy gain.
+NL_MODEL = "claude-sonnet-5"
