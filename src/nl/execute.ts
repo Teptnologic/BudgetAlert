@@ -107,25 +107,28 @@ export async function executeBatch(env: Env, intents: Intent[]): Promise<Reply> 
       steps.length === 1
         ? "I couldn't do that:"
         : "I couldn't do all of that, so I haven't done any of it:";
-    return { text: `${header}\n${numbered(steps.map((s) => withCmd(s.text, s.cmd)))}` };
+    return { text: `${header}\n${numbered(steps.map((s) => s.text))}` };
   }
 
-  const body =
-    steps.length === 1
-      ? `${steps[0].text}?\n${cmdLine(steps[0].cmd)}`
-      : `I'll do ${steps.length} things:\n${numbered(steps.map((s) => withCmd(s.text, s.cmd)))}`;
+  const blocks = steps.map((s, i) => {
+    const heading = steps.length === 1 ? s.view.title : `${i + 1}. ${s.view.title}`;
+    return [`<b>${esc(heading)}</b>`, ...fieldLines(s.view.fields)].join("\n");
+  });
 
-  return { text: body, confirmToken: token() };
+  const header =
+    steps.length === 1 ? "Confirm this?" : `Confirm these ${steps.length} changes?`;
+
+  return { text: `${header}\n\n${blocks.join("\n\n")}`, confirmToken: token() };
 }
 
-// The prose summary can read plausibly while an argument is quietly wrong, so
-// each step also shows the resolved call it will make.
-function cmdLine(cmd: string): string {
-  return `<code>${esc(cmd)}</code>`;
-}
-
-function withCmd(text: string, cmd: string): string {
-  return `${text}\n   ${cmdLine(cmd)}`;
+// The parse, spelled out. A one-line summary can read plausibly while a single
+// field is quietly wrong — showing every field is what makes that visible.
+// Labels are padded into a monospace column so values line up.
+function fieldLines(fields: [string, string][]): string[] {
+  const width = Math.max(...fields.map(([label]) => label.length), 0);
+  return fields.map(
+    ([label, value]) => `<code>${esc(label.padEnd(width))}</code>  ${esc(value)}`,
+  );
 }
 
 // Run an approved batch: writes first, then reads so their answers reflect the

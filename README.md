@@ -62,14 +62,24 @@ mean:
 @budgetbot set my weekly budget to 400
 ```
 
-Every confirmation shows the resolved call beneath the summary, so a misparse is
-visible before you approve it rather than after:
+Every confirmation spells out how the message was understood, field by field, so
+a misparse is visible before you approve it rather than after:
 
 ```
-Add $12.00 — lunch (yesterday)?
-add_transaction(amount=12.00, merchant="lunch", days_ago=1)
-                                          [✅ Yes]  [✖️ No]
+Confirm this?
+
+Add transaction
+Amount    $12.00
+Merchant  lunch
+When      Yesterday
+Budget    Main budget
+                          [✅ Yes]  [✖️ No]
 ```
+
+A batch numbers each step the same way. The fields matter most where two similar
+numbers appear in one sentence — "change the $84 charge to $48" renders as
+`Which charge → The $84.00 charge` and `New amount → $48.60`, so a swap is
+obvious at a glance.
 
 `add_transaction` covers spending the bank never emails about — cash, a split
 bill, a card whose alerts aren't wired up. It records against today unless you

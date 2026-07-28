@@ -9,7 +9,7 @@ import {
   isMutating,
   unknownIntent,
 } from "../src/nl/schema";
-import { planBatch, formatCmd } from "../src/nl/plan";
+import { planBatch, describeIntent } from "../src/nl/plan";
 import { executeBatch } from "../src/nl/execute";
 import { periodStart, periodLabel, isPeriod } from "../src/core/period";
 
@@ -517,52 +517,64 @@ describe("planBatch projection", () => {
   });
 });
 
-// The prose summary can read plausibly while an argument is quietly wrong, so
-// the confirmation shows the resolved call. These assert the arguments a
+// The one-line summary can read plausibly while a single field is quietly
+// wrong, so the confirmation spells the parse out. These assert the fields a
 // misparse would land in.
-describe("formatCmd", () => {
-  const cmd = (raw: any) => formatCmd(normalizeBatch({ actions: [raw] })[0]);
+describe("describeIntent", () => {
+  const view = (raw: any) => describeIntent(normalizeBatch({ actions: [raw] })[0], "USD");
+  const asMap = (raw: any) => Object.fromEntries(view(raw).fields);
 
-  it("renders a manual transaction with its arguments", () => {
-    expect(cmd({ action: "add_transaction", amount: 12, merchant: "lunch", days_ago: 1 })).toBe(
-      'add_transaction(amount=12.00, merchant="lunch", days_ago=1)',
-    );
+  it("titles each action in plain English, not its identifier", () => {
+    expect(view({ action: "add_transaction", amount: 1 }).title).toBe("Add transaction");
+    expect(view({ action: "set_transaction_amount" }).title).toBe("Correct amount");
+    expect(view({ action: "create_category" }).title).toBe("New budget envelope");
   });
 
-  it("omits arguments that were not given", () => {
-    expect(cmd({ action: "add_transaction", amount: 12 })).toBe("add_transaction(amount=12.00)");
+  it("describes a manual transaction field by field", () => {
+    expect(asMap({ action: "add_transaction", amount: 12, merchant: "lunch", days_ago: 1 })).toEqual({
+      Amount: "$12.00",
+      Merchant: "lunch",
+      When: "Yesterday",
+      Budget: "Main budget",
+    });
   });
 
-  it("shows how a transaction was selected", () => {
-    expect(cmd({ action: "move_transaction", category: "gift", selector_kind: "last" })).toBe(
-      'move_transaction(select=last, category="gift")',
-    );
-    expect(
-      cmd({ action: "move_transaction", category: "gift", selector_kind: "amount", amount: 200 }),
-    ).toBe('move_transaction(select=amount:200.00, category="gift")');
+  it("spells out relative dates", () => {
+    const when = (d: number) => asMap({ action: "add_transaction", amount: 1, days_ago: d }).When;
+    expect(when(0)).toBe("Today");
+    expect(when(1)).toBe("Yesterday");
+    expect(when(3)).toBe("3 days ago");
+  });
+
+  it("says how the transaction was picked", () => {
+    const which = (raw: any) => asMap({ action: "move_transaction", category: "gift", ...raw })["Which charge"];
+    expect(which({ selector_kind: "last" })).toBe("Most recent charge");
+    expect(which({ selector_kind: "amount", amount: 200 })).toBe("The $200.00 charge");
+    expect(which({ selector_kind: "merchant", selector_value: "TOP GOLF" })).toContain("TOP GOLF");
   });
 
   // The distinction that matters most: which transaction vs what it becomes.
   it("keeps the identifying amount distinct from the replacement", () => {
     expect(
-      cmd({ action: "set_transaction_amount", selector_kind: "amount", amount: 84, new_amount: 48.6 }),
-    ).toBe("set_transaction_amount(select=amount:84.00, new_amount=48.60)");
+      asMap({ action: "set_transaction_amount", selector_kind: "amount", amount: 84, new_amount: 48.6 }),
+    ).toEqual({ "Which charge": "The $84.00 charge", "New amount": "$48.60" });
   });
 
-  it("renders a category creation in full", () => {
+  it("describes a new envelope with its reset cadence", () => {
     expect(
-      cmd({
+      asMap({
         action: "create_category",
         category: "gift",
         category_label: "Yearly gift budget",
         amount: 1200,
         period: "yearly",
       }),
-    ).toBe('create_category(name="gift", label="Yearly gift budget", amount=1200.00, period=yearly)');
+    ).toEqual({ Name: "Yearly gift budget", Limit: "$1,200.00", Resets: "Yearly" });
   });
 
-  it("escapes quotes so a merchant name can't break the rendering", () => {
-    expect(cmd({ action: "add_transaction", amount: 5, merchant: 'Bob"s' })).toContain('\\"');
+  it("distinguishes a category budget from the main one", () => {
+    expect(asMap({ action: "set_budget", amount: 400 }).Budget).toBe("Main budget");
+    expect(asMap({ action: "set_budget", amount: 400, category: "gift" }).Budget).toBe("gift");
   });
 });
 
@@ -579,7 +591,8 @@ describe("executeBatch", () => {
       normalizeBatch({ actions: [{ action: "move_transaction", category: "gift", selector_kind: "last" }] }),
     );
     expect(reply.confirmToken).toBeTruthy();
-    expect(reply.text).toContain("TOP GOLF");
+    expect(reply.text).toContain("<b>Move transaction</b>");
+    expect(reply.text).toContain("Most recent charge");
   });
 
   // Validate upfront: one broken step blocks everything, so a partly understood
@@ -609,30 +622,33 @@ describe("executeBatch", () => {
       }),
     );
     expect(reply.confirmToken).toBeTruthy();
-    expect(reply.text).toContain("I'll do 2 things:");
-    expect(reply.text).toContain("1.");
-    expect(reply.text).toContain("2.");
+    expect(reply.text).toContain("Confirm these 2 changes?");
+    expect(reply.text).toContain("<b>1. Set budget</b>");
+    expect(reply.text).toContain("<b>2. Move transaction</b>");
   });
 
   // Regression: a single action should still read as one line, not a list of one.
-  it("keeps a single action as one question, not a list of one", async () => {
+  it("keeps a single action unnumbered", async () => {
     const reply = await executeBatch(
       env(),
       normalizeBatch({ actions: [{ action: "set_budget", amount: 400 }] }),
     );
+    expect(reply.text).toContain("Confirm this?");
     expect(reply.text).not.toContain("1.");
-    expect(reply.text.split("\n")[0].trim().endsWith("?")).toBe(true);
   });
 
-  it("shows the resolved command under every confirmation", async () => {
+  it("spells out the parsed fields under every confirmation", async () => {
     const reply = await executeBatch(
       env(),
       normalizeBatch({ actions: [{ action: "set_budget", amount: 400 }] }),
     );
-    expect(reply.text).toContain("<code>set_budget(amount=400.00)</code>");
+    expect(reply.text).toContain("<b>Set budget</b>");
+    expect(reply.text).toContain("Main budget");
+    expect(reply.text).toContain("$400.00");
+    expect(reply.text).not.toContain("set_budget(");
   });
 
-  it("shows a command for each step of a batch", async () => {
+  it("numbers and describes each step of a batch", async () => {
     const reply = await executeBatch(
       env(),
       normalizeBatch({
@@ -642,8 +658,20 @@ describe("executeBatch", () => {
         ],
       }),
     );
-    expect(reply.text).toContain("add_transaction(amount=12.00");
-    expect(reply.text).toContain("move_transaction(select=last");
+    expect(reply.text).toContain("Confirm these 2 changes?");
+    expect(reply.text).toContain("<b>1. Add transaction</b>");
+    expect(reply.text).toContain("<b>2. Move transaction</b>");
+    expect(reply.text).toContain("Most recent charge");
+  });
+
+  it("escapes a merchant name that would otherwise break the markup", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({
+        actions: [{ action: "add_transaction", amount: 5, merchant: "Bob & <b>Sons</b>" }],
+      }),
+    );
+    expect(reply.text).toContain("Bob &amp; &lt;b&gt;Sons&lt;/b&gt;");
   });
 });
 

@@ -33,56 +33,89 @@ export interface PlannedStep {
   ok: boolean;
   /** What this step will do, or why it can't. */
   text: string;
-  /** The resolved call this step will make, shown so a misparse is visible. */
-  cmd: string;
+  /** The parsed intent, shown so a misparse is visible before approval. */
+  view: IntentView;
 }
 
-// Render the intent as the call it will actually make. This is the check on the
-// model: the prose summary can read plausibly while a field is quietly wrong, so
-// the confirmation shows the arguments too.
-export function formatCmd(intent: Intent): string {
-  const q = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
-  const args: string[] = [];
-  const push = (k: string, v: string | number) => args.push(`${k}=${v}`);
+// How the intent is shown back to the user before they approve it. This is the
+// check on the model: the one-line summary can read plausibly while a single
+// field is quietly wrong, so the confirmation spells the parse out in full.
+export interface IntentView {
+  title: string;
+  fields: [label: string, value: string][];
+}
+
+const TITLES: Record<string, string> = {
+  add_transaction: "Add transaction",
+  move_transaction: "Move transaction",
+  set_transaction_amount: "Correct amount",
+  set_budget: "Set budget",
+  create_category: "New budget envelope",
+  set_period: "Change budget window",
+};
+
+const PERIOD_WORDS: Record<string, string> = {
+  weekly: "Weekly",
+  monthly: "Monthly",
+  yearly: "Yearly",
+};
+
+export function describeIntent(intent: Intent, currency: string): IntentView {
+  const money = (n: number) => formatMoney(n, currency);
+  const fields: [string, string][] = [];
+  const add = (label: string, value: string) => fields.push([label, value]);
+
+  const which = (): string => {
+    if (intent.selectorKind === "last") return "Most recent charge";
+    if (intent.selectorKind === "amount") return `The ${money(intent.amount)} charge`;
+    if (intent.selectorKind === "merchant") return `Matching “${intent.selectorValue}”`;
+    return "—";
+  };
+
+  const when = (): string => {
+    if (intent.daysAgo === 0) return "Today";
+    if (intent.daysAgo === 1) return "Yesterday";
+    return `${intent.daysAgo} days ago`;
+  };
 
   switch (intent.action) {
     case "add_transaction":
-      push("amount", intent.amount.toFixed(2));
-      if (intent.merchant) push("merchant", q(intent.merchant));
-      if (intent.category) push("category", q(intent.category));
-      if (intent.daysAgo) push("days_ago", intent.daysAgo);
+      add("Amount", money(intent.amount));
+      if (intent.merchant) add("Merchant", intent.merchant);
+      add("When", when());
+      add("Budget", intent.category ? intent.category : "Main budget");
       break;
+
     case "move_transaction":
-      push("select", `${intent.selectorKind}${selectorArg(intent)}`);
-      push("category", q(intent.category));
+      add("Which charge", which());
+      add("Move into", intent.category || "—");
       break;
+
     case "set_transaction_amount":
-      push("select", `${intent.selectorKind}${selectorArg(intent)}`);
-      push("new_amount", intent.newAmount.toFixed(2));
+      add("Which charge", which());
+      add("New amount", money(intent.newAmount));
       break;
+
     case "set_budget":
-      push("amount", intent.amount.toFixed(2));
-      if (intent.category) push("category", q(intent.category));
+      add("Budget", intent.category ? intent.category : "Main budget");
+      add("New limit", money(intent.amount));
       break;
+
     case "create_category":
-      push("name", q(intent.category));
-      push("label", q(intent.categoryLabel || intent.category));
-      push("amount", intent.amount.toFixed(2));
-      push("period", intent.period === "none" ? "yearly" : intent.period);
+      add("Name", intent.categoryLabel || intent.category);
+      add("Limit", money(intent.amount));
+      add("Resets", PERIOD_WORDS[intent.period === "none" ? "yearly" : intent.period]);
       break;
+
     case "set_period":
-      push("period", intent.period);
+      add("Resets", PERIOD_WORDS[intent.period] ?? intent.period);
       break;
+
     default:
       break;
   }
-  return `${intent.action}(${args.join(", ")})`;
-}
 
-function selectorArg(intent: Intent): string {
-  if (intent.selectorKind === "amount") return `:${intent.amount.toFixed(2)}`;
-  if (intent.selectorKind === "merchant") return `:"${intent.selectorValue}"`;
-  return "";
+  return { title: TITLES[intent.action] ?? intent.action, fields };
 }
 
 export interface StepOutcome {
@@ -136,7 +169,7 @@ async function planStep(
   env: Env,
   intent: Intent,
   p: Projection,
-): Promise<Omit<PlannedStep, "cmd">> {
+): Promise<Omit<PlannedStep, "view">> {
   const money = (n: number) => formatMoney(n, p.currency);
 
   switch (intent.action) {
@@ -274,7 +307,7 @@ export async function planBatch(env: Env, intents: Intent[]): Promise<PlannedSte
   const steps: PlannedStep[] = [];
   for (const intent of intents) {
     const step = await planStep(env, intent, projection);
-    steps.push({ ...step, cmd: formatCmd(intent) });
+    steps.push({ ...step, view: describeIntent(intent, projection.currency) });
   }
   return steps;
 }
