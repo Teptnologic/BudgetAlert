@@ -107,15 +107,25 @@ export async function executeBatch(env: Env, intents: Intent[]): Promise<Reply> 
       steps.length === 1
         ? "I couldn't do that:"
         : "I couldn't do all of that, so I haven't done any of it:";
-    return { text: `${header}\n${numbered(steps.map((s) => s.text))}` };
+    return { text: `${header}\n${numbered(steps.map((s) => withCmd(s.text, s.cmd)))}` };
   }
 
   const body =
     steps.length === 1
-      ? `${steps[0].text}?`
-      : `I'll do ${steps.length} things:\n${numbered(steps.map((s) => s.text))}`;
+      ? `${steps[0].text}?\n${cmdLine(steps[0].cmd)}`
+      : `I'll do ${steps.length} things:\n${numbered(steps.map((s) => withCmd(s.text, s.cmd)))}`;
 
   return { text: body, confirmToken: token() };
+}
+
+// The prose summary can read plausibly while an argument is quietly wrong, so
+// each step also shows the resolved call it will make.
+function cmdLine(cmd: string): string {
+  return `<code>${esc(cmd)}</code>`;
+}
+
+function withCmd(text: string, cmd: string): string {
+  return `${text}\n   ${cmdLine(cmd)}`;
 }
 
 // Run an approved batch: writes first, then reads so their answers reflect the
@@ -140,6 +150,7 @@ export async function applyApproved(env: Env, intents: Intent[]): Promise<string
 
   // Anything that shifts spend or the limit changes what's left, so show it.
   const changesRemaining: Intent["action"][] = [
+    "add_transaction",
     "move_transaction",
     "set_transaction_amount",
     "set_budget",

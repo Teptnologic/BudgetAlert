@@ -54,12 +54,27 @@ different chat platform later means swapping an adapter, not a rewrite.
 mean:
 
 ```
+@budgetbot I spent $12 on lunch yesterday
 @budgetbot move the last $200 charge into yearly gift budget
 @budgetbot create a yearly gift budget of 1200
 @budgetbot change the last charge to $48.60
 @budgetbot how much did I spend on gifts this year?
 @budgetbot set my weekly budget to 400
 ```
+
+Every confirmation shows the resolved call beneath the summary, so a misparse is
+visible before you approve it rather than after:
+
+```
+Add $12.00 — lunch (yesterday)?
+add_transaction(amount=12.00, merchant="lunch", days_ago=1)
+                                          [✅ Yes]  [✖️ No]
+```
+
+`add_transaction` covers spending the bank never emails about — cash, a split
+bill, a card whose alerts aren't wired up. It records against today unless you
+say otherwise ("yesterday", "3 days ago"), and can file straight into an
+envelope.
 
 One message can carry several actions, and later ones can depend on earlier ones
 — *"create a yearly gift budget of 1200 and move the last $200 charge into it"*

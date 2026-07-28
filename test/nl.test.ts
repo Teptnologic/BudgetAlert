@@ -9,7 +9,7 @@ import {
   isMutating,
   unknownIntent,
 } from "../src/nl/schema";
-import { planBatch } from "../src/nl/plan";
+import { planBatch, formatCmd } from "../src/nl/plan";
 import { executeBatch } from "../src/nl/execute";
 import { periodStart, periodLabel, isPeriod } from "../src/core/period";
 
@@ -395,6 +395,53 @@ describe("planBatch projection", () => {
     expect(steps[1].text).toContain("STARBUCKS");
   });
 
+  it("plans a manual transaction", async () => {
+    const env = fakeEnv({});
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [{ action: "add_transaction", amount: 12, merchant: "lunch", days_ago: 1 }],
+      }),
+    );
+    expect(steps[0].ok).toBe(true);
+    expect(steps[0].text).toContain("$12.00");
+    expect(steps[0].text).toContain("lunch");
+    expect(steps[0].text).toContain("yesterday");
+  });
+
+  it("rejects a manual transaction with no amount", async () => {
+    const steps = await planBatch(
+      fakeEnv({}),
+      normalizeBatch({ actions: [{ action: "add_transaction", merchant: "lunch" }] }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].text).toContain("No amount");
+  });
+
+  it("can file a manual transaction straight into an envelope", async () => {
+    const env = fakeEnv({
+      categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+    });
+    const steps = await planBatch(
+      env,
+      normalizeBatch({
+        actions: [{ action: "add_transaction", amount: 40, merchant: "flowers", category: "gift" }],
+      }),
+    );
+    expect(steps[0].ok).toBe(true);
+    expect(steps[0].text).toContain("Gift");
+  });
+
+  it("rejects filing a manual transaction into an unknown envelope", async () => {
+    const steps = await planBatch(
+      fakeEnv({}),
+      normalizeBatch({
+        actions: [{ action: "add_transaction", amount: 40, category: "nope" }],
+      }),
+    );
+    expect(steps[0].ok).toBe(false);
+  });
+
   it("plans an amount correction, naming both the old and new figure", async () => {
     const env = fakeEnv({ transactions: txns });
     const steps = await planBatch(
@@ -470,6 +517,55 @@ describe("planBatch projection", () => {
   });
 });
 
+// The prose summary can read plausibly while an argument is quietly wrong, so
+// the confirmation shows the resolved call. These assert the arguments a
+// misparse would land in.
+describe("formatCmd", () => {
+  const cmd = (raw: any) => formatCmd(normalizeBatch({ actions: [raw] })[0]);
+
+  it("renders a manual transaction with its arguments", () => {
+    expect(cmd({ action: "add_transaction", amount: 12, merchant: "lunch", days_ago: 1 })).toBe(
+      'add_transaction(amount=12.00, merchant="lunch", days_ago=1)',
+    );
+  });
+
+  it("omits arguments that were not given", () => {
+    expect(cmd({ action: "add_transaction", amount: 12 })).toBe("add_transaction(amount=12.00)");
+  });
+
+  it("shows how a transaction was selected", () => {
+    expect(cmd({ action: "move_transaction", category: "gift", selector_kind: "last" })).toBe(
+      'move_transaction(select=last, category="gift")',
+    );
+    expect(
+      cmd({ action: "move_transaction", category: "gift", selector_kind: "amount", amount: 200 }),
+    ).toBe('move_transaction(select=amount:200.00, category="gift")');
+  });
+
+  // The distinction that matters most: which transaction vs what it becomes.
+  it("keeps the identifying amount distinct from the replacement", () => {
+    expect(
+      cmd({ action: "set_transaction_amount", selector_kind: "amount", amount: 84, new_amount: 48.6 }),
+    ).toBe("set_transaction_amount(select=amount:84.00, new_amount=48.60)");
+  });
+
+  it("renders a category creation in full", () => {
+    expect(
+      cmd({
+        action: "create_category",
+        category: "gift",
+        category_label: "Yearly gift budget",
+        amount: 1200,
+        period: "yearly",
+      }),
+    ).toBe('create_category(name="gift", label="Yearly gift budget", amount=1200.00, period=yearly)');
+  });
+
+  it("escapes quotes so a merchant name can't break the rendering", () => {
+    expect(cmd({ action: "add_transaction", amount: 5, merchant: 'Bob"s' })).toContain('\\"');
+  });
+});
+
 describe("executeBatch", () => {
   const env = () =>
     fakeEnv({
@@ -519,13 +615,35 @@ describe("executeBatch", () => {
   });
 
   // Regression: a single action should still read as one line, not a list of one.
-  it("keeps a single action as a one-line question", async () => {
+  it("keeps a single action as one question, not a list of one", async () => {
     const reply = await executeBatch(
       env(),
       normalizeBatch({ actions: [{ action: "set_budget", amount: 400 }] }),
     );
     expect(reply.text).not.toContain("1.");
-    expect(reply.text.trim().endsWith("?")).toBe(true);
+    expect(reply.text.split("\n")[0].trim().endsWith("?")).toBe(true);
+  });
+
+  it("shows the resolved command under every confirmation", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({ actions: [{ action: "set_budget", amount: 400 }] }),
+    );
+    expect(reply.text).toContain("<code>set_budget(amount=400.00)</code>");
+  });
+
+  it("shows a command for each step of a batch", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({
+        actions: [
+          { action: "add_transaction", amount: 12, merchant: "lunch" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(reply.text).toContain("add_transaction(amount=12.00");
+    expect(reply.text).toContain("move_transaction(select=last");
   });
 });
 

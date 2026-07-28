@@ -253,6 +253,7 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "/setgroup — send alerts &amp; summaries here\n" +
           "/help — this message\n\n" +
           "<b>Or just @ me:</b>\n" +
+          "<i>@bot I spent $12 on lunch yesterday</i>\n" +
           "<i>@bot move the last $200 charge into yearly gift budget</i>\n" +
           "<i>@bot create a yearly gift budget of 1200</i>\n" +
           "<i>@bot change the last charge to $48.60</i>\n" +

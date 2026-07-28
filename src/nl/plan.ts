@@ -13,7 +13,7 @@
 import type { Env } from "../env";
 import type { Intent } from "./schema";
 import { isMutating } from "./schema";
-import { isPeriod, type Period } from "../core/period";
+import { isPeriod, daysAgo, type Period } from "../core/period";
 import { formatMoney } from "../core/engine";
 import {
   getConfig,
@@ -21,6 +21,7 @@ import {
   findCategory,
   findTransaction,
   upsertCategory,
+  addManualTransaction,
   setCategoryBudget,
   setTxnCategory,
   setTxnAmount,
@@ -32,6 +33,56 @@ export interface PlannedStep {
   ok: boolean;
   /** What this step will do, or why it can't. */
   text: string;
+  /** The resolved call this step will make, shown so a misparse is visible. */
+  cmd: string;
+}
+
+// Render the intent as the call it will actually make. This is the check on the
+// model: the prose summary can read plausibly while a field is quietly wrong, so
+// the confirmation shows the arguments too.
+export function formatCmd(intent: Intent): string {
+  const q = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
+  const args: string[] = [];
+  const push = (k: string, v: string | number) => args.push(`${k}=${v}`);
+
+  switch (intent.action) {
+    case "add_transaction":
+      push("amount", intent.amount.toFixed(2));
+      if (intent.merchant) push("merchant", q(intent.merchant));
+      if (intent.category) push("category", q(intent.category));
+      if (intent.daysAgo) push("days_ago", intent.daysAgo);
+      break;
+    case "move_transaction":
+      push("select", `${intent.selectorKind}${selectorArg(intent)}`);
+      push("category", q(intent.category));
+      break;
+    case "set_transaction_amount":
+      push("select", `${intent.selectorKind}${selectorArg(intent)}`);
+      push("new_amount", intent.newAmount.toFixed(2));
+      break;
+    case "set_budget":
+      push("amount", intent.amount.toFixed(2));
+      if (intent.category) push("category", q(intent.category));
+      break;
+    case "create_category":
+      push("name", q(intent.category));
+      push("label", q(intent.categoryLabel || intent.category));
+      push("amount", intent.amount.toFixed(2));
+      push("period", intent.period === "none" ? "yearly" : intent.period);
+      break;
+    case "set_period":
+      push("period", intent.period);
+      break;
+    default:
+      break;
+  }
+  return `${intent.action}(${args.join(", ")})`;
+}
+
+function selectorArg(intent: Intent): string {
+  if (intent.selectorKind === "amount") return `:${intent.amount.toFixed(2)}`;
+  if (intent.selectorKind === "merchant") return `:"${intent.selectorValue}"`;
+  return "";
 }
 
 export interface StepOutcome {
@@ -81,10 +132,30 @@ async function buildProjection(env: Env): Promise<Projection> {
 /* ------------------------------------------------------------------- plan */
 
 // Validate one step against the projection and, if valid, advance it.
-async function planStep(env: Env, intent: Intent, p: Projection): Promise<PlannedStep> {
+async function planStep(
+  env: Env,
+  intent: Intent,
+  p: Projection,
+): Promise<Omit<PlannedStep, "cmd">> {
   const money = (n: number) => formatMoney(n, p.currency);
 
   switch (intent.action) {
+    case "add_transaction": {
+      if (intent.amount <= 0) return { ok: false, text: "⚠️ No amount given." };
+      let where = "";
+      if (intent.category) {
+        const cat = p.categories.get(intent.category);
+        if (!cat) {
+          return { ok: false, text: `⚠️ No budget called <b>${esc(intent.category)}</b>.` };
+        }
+        where = ` to <b>${esc(cat.label)}</b>`;
+      }
+      const when =
+        intent.daysAgo === 0 ? "" : intent.daysAgo === 1 ? " (yesterday)" : ` (${intent.daysAgo}d ago)`;
+      const who = intent.merchant ? ` — ${esc(intent.merchant)}` : "";
+      return { ok: true, text: `Add ${money(intent.amount)}${who}${where}${when}` };
+    }
+
     case "create_category": {
       if (!intent.category) return { ok: false, text: "⚠️ No budget name given." };
       const period = intent.period === "none" ? "yearly" : intent.period;
@@ -202,7 +273,8 @@ export async function planBatch(env: Env, intents: Intent[]): Promise<PlannedSte
   const projection = await buildProjection(env);
   const steps: PlannedStep[] = [];
   for (const intent of intents) {
-    steps.push(await planStep(env, intent, projection));
+    const step = await planStep(env, intent, projection);
+    steps.push({ ...step, cmd: formatCmd(intent) });
   }
   return steps;
 }
@@ -220,6 +292,29 @@ async function applyStep(
   const money = (n: number) => formatMoney(n, currency);
 
   switch (intent.action) {
+    case "add_transaction": {
+      if (intent.amount <= 0) return { ok: false, text: "No amount given" };
+      let categoryId: number | null = null;
+      let where = "";
+      if (intent.category) {
+        const cat = await findCategory(env, intent.category);
+        if (!cat) return { ok: false, text: `<b>${esc(intent.category)}</b> no longer exists` };
+        categoryId = cat.id;
+        where = ` to <b>${esc(cat.label)}</b>`;
+      }
+      const occurredAt = daysAgo(intent.daysAgo).toISOString();
+      await addManualTransaction(
+        env,
+        intent.amount,
+        intent.merchant || null,
+        currency,
+        occurredAt,
+        categoryId,
+      );
+      const who = intent.merchant ? ` — ${esc(intent.merchant)}` : "";
+      return { ok: true, text: `Added ${money(intent.amount)}${who}${where}` };
+    }
+
     case "create_category": {
       const period = intent.period === "none" ? "yearly" : intent.period;
       const label = intent.categoryLabel || intent.category;

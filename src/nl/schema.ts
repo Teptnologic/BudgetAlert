@@ -26,8 +26,10 @@ const ACTION_SCHEMA = {
     "action",
     "category",
     "category_label",
+    "merchant",
     "amount",
     "new_amount",
+    "days_ago",
     "period",
     "window",
     "selector_kind",
@@ -42,6 +44,7 @@ const ACTION_SCHEMA = {
         "get_status",
         "query_spend",
         "list_recent",
+        "add_transaction",
         "move_transaction",
         "set_transaction_amount",
         "set_budget",
@@ -70,6 +73,16 @@ const ACTION_SCHEMA = {
       type: "number",
       description:
         "For set_transaction_amount only: the corrected amount the transaction should become. In 'change the $84 charge to $48', amount is 84 (which transaction) and new_amount is 48 (what it becomes). 0 when not applicable.",
+    },
+    merchant: {
+      type: "string",
+      description:
+        "For add_transaction: where the money went, e.g. 'Corner Cafe'. Use the user's own words; empty string if they didn't say.",
+    },
+    days_ago: {
+      type: "integer",
+      description:
+        "For add_transaction: how many days back the spend happened. 0 = today, 1 = yesterday. Use 0 unless the user says otherwise.",
     },
     period: {
       type: "string",
@@ -131,6 +144,7 @@ export type Action =
   | "get_status"
   | "query_spend"
   | "list_recent"
+  | "add_transaction"
   | "move_transaction"
   | "set_transaction_amount"
   | "set_budget"
@@ -147,8 +161,10 @@ export interface Intent {
   action: Action;
   category: string;
   categoryLabel: string;
+  merchant: string;
   amount: number;
   newAmount: number;
+  daysAgo: number;
   period: PeriodOrNone;
   window: Window;
   selectorKind: SelectorKind;
@@ -159,6 +175,7 @@ export interface Intent {
 
 // Which actions change stored data (and therefore need confirmation).
 const MUTATING: ReadonlySet<Action> = new Set<Action>([
+  "add_transaction",
   "move_transaction",
   "set_transaction_amount",
   "set_budget",
@@ -207,8 +224,12 @@ export function normalizeIntent(raw: unknown): Intent {
     action: pickEnum<Action>(o.action, ACTIONS, "unknown"),
     category: str(o.category).toLowerCase(),
     categoryLabel: str(either("category_label", "categoryLabel")),
+    merchant: str(o.merchant),
     amount: Math.abs(num(o.amount)),
     newAmount: Math.abs(num(either("new_amount", "newAmount"))),
+    // Clamped to a year: a mistyped 20260 must not backdate spend out of every
+    // budget period and silently vanish from the totals.
+    daysAgo: Math.min(365, Math.max(0, Math.trunc(num(either("days_ago", "daysAgo"))))),
     period: pickEnum<PeriodOrNone>(o.period, PERIODS, "none"),
     window: pickEnum<Window>(o.window, WINDOWS, "none"),
     selectorKind: pickEnum<SelectorKind>(either("selector_kind", "selectorKind"), SELECTORS, "none"),

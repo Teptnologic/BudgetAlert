@@ -233,6 +233,29 @@ export async function findTransaction(
     .first<FullTxnRow>();
 }
 
+// Record a transaction the bank never emailed about — cash, a split bill, a
+// card the alerts aren't wired to.
+//
+// Unlike email capture there is nothing to dedupe against: two $4 coffees on
+// the same day are two real transactions, so the hash is random rather than
+// derived from the contents.
+export async function addManualTransaction(
+  env: Env,
+  amount: number,
+  merchant: string | null,
+  currency: string,
+  occurredAt: string,
+  categoryId: number | null,
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO transactions
+       (amount, merchant, currency, occurred_at, source, raw_hash, category_id)
+     VALUES (?, ?, ?, ?, 'manual', ?, ?)`,
+  )
+    .bind(amount, merchant, currency, occurredAt, `manual:${crypto.randomUUID()}`, categoryId)
+    .run();
+}
+
 // Correct a captured amount — bank alerts often land pre-tip, or get the figure
 // wrong outright. Budget totals are summed live, so every status recomputes on
 // the next read with no cached figure to invalidate.
