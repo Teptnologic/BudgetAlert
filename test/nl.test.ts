@@ -214,6 +214,36 @@ describe("normalizeIntent", () => {
     }
   });
 
+  // Regression: the `amount` description didn't list add_transaction, so the
+  // model put the figure in new_amount and every "add a spending of $X" was
+  // rejected with "no amount given".
+  it("recovers an add_transaction amount that landed in new_amount", () => {
+    const i = normalizeIntent({
+      action: "add_transaction",
+      merchant: "water heater",
+      category: "gift",
+      amount: 0,
+      new_amount: 166.67,
+    });
+    expect(i.amount).toBe(166.67);
+  });
+
+  it("does not let that fallback disturb a correction's two amounts", () => {
+    const i = normalizeIntent({
+      action: "set_transaction_amount",
+      selector_kind: "amount",
+      amount: 84,
+      new_amount: 48.6,
+    });
+    expect(i.amount).toBe(84);
+    expect(i.newAmount).toBe(48.6);
+  });
+
+  it("keeps a normal add_transaction amount untouched", () => {
+    const i = normalizeIntent({ action: "add_transaction", amount: 12, new_amount: 0 });
+    expect(i.amount).toBe(12);
+  });
+
   it("coerces amounts to a positive number", () => {
     expect(normalizeIntent({ amount: -200 }).amount).toBe(200);
     expect(normalizeIntent({ amount: "84.50" }).amount).toBe(84.5);
@@ -662,6 +692,38 @@ describe("executeBatch", () => {
     expect(reply.text).toContain("<b>1. Add transaction</b>");
     expect(reply.text).toContain("<b>2. Move transaction</b>");
     expect(reply.text).toContain("Most recent charge");
+  });
+
+  // A rejected step is exactly when the parse needs to be visible.
+  it("shows the parsed fields when a step is rejected", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({ actions: [{ action: "add_transaction", merchant: "water heater" }] }),
+    );
+    expect(reply.confirmToken).toBeUndefined();
+    expect(reply.text).toContain("No amount");
+    expect(reply.text).toContain("<b>Add transaction</b>");
+    expect(reply.text).toContain("water heater");
+  });
+
+  it("plans the full water-heater phrasing end to end", async () => {
+    const reply = await executeBatch(
+      env(),
+      normalizeBatch({
+        actions: [
+          {
+            action: "add_transaction",
+            amount: 166.67,
+            merchant: "water heater",
+            category: "gift",
+          },
+        ],
+      }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("$166.67");
+    expect(reply.text).toContain("water heater");
+    expect(reply.text).toContain("gift");
   });
 
   it("escapes a merchant name that would otherwise break the markup", async () => {

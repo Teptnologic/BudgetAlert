@@ -67,7 +67,7 @@ const ACTION_SCHEMA = {
     amount: {
       type: "number",
       description:
-        "Money amount in the message for set_budget/create_category, or the amount used to identify a transaction when selector_kind is 'amount'. 0 when not applicable.",
+        "The money amount in the message. For add_transaction, how much was spent. For set_budget and create_category, the budget limit. For move_transaction and set_transaction_amount with selector_kind 'amount', the amount that identifies which existing transaction is meant. 0 only when the message truly has no amount.",
     },
     new_amount: {
       type: "number",
@@ -220,13 +220,18 @@ function num(raw: unknown): number {
 export function normalizeIntent(raw: unknown): Intent {
   const o = (raw ?? {}) as Record<string, unknown>;
   const either = (snake: string, camel: string): unknown => o[snake] ?? o[camel];
+  const action = pickEnum<Action>(o.action, ACTIONS, "unknown");
+  const amount = Math.abs(num(o.amount));
+  const newAmount = Math.abs(num(either("new_amount", "newAmount")));
   return {
-    action: pickEnum<Action>(o.action, ACTIONS, "unknown"),
+    action,
     category: str(o.category).toLowerCase(),
     categoryLabel: str(either("category_label", "categoryLabel")),
     merchant: str(o.merchant),
-    amount: Math.abs(num(o.amount)),
-    newAmount: Math.abs(num(either("new_amount", "newAmount"))),
+    // Adding a transaction has only one amount, so if it landed in new_amount
+    // take it rather than rejecting a message that plainly stated a figure.
+    amount: action === "add_transaction" && amount === 0 ? newAmount : amount,
+    newAmount,
     // Clamped to a year: a mistyped 20260 must not backdate spend out of every
     // budget period and silently vanish from the totals.
     daysAgo: Math.min(365, Math.max(0, Math.trunc(num(either("days_ago", "daysAgo"))))),

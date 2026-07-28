@@ -102,12 +102,22 @@ export async function executeBatch(env: Env, intents: Intent[]): Promise<Reply> 
 
   // Validate upfront: one broken step blocks the whole batch, so a partially
   // understood message never half-applies.
+  // Show the parse on failure too. A rejected step is exactly when the user
+  // needs to see how the message was read — "no amount given" is baffling when
+  // they plainly gave one, and the fields say where it actually landed.
   if (bad.length) {
     const header =
       steps.length === 1
         ? "I couldn't do that:"
         : "I couldn't do all of that, so I haven't done any of it:";
-    return { text: `${header}\n${numbered(steps.map((s) => s.text))}` };
+    const blocks = steps.map((s, i) => {
+      const heading = steps.length === 1 ? s.view.title : `${i + 1}. ${s.view.title}`;
+      return [
+        `<b>${esc(heading)}</b> — ${s.text}`,
+        ...fieldLines(s.view.fields),
+      ].join("\n");
+    });
+    return { text: `${header}\n\n${blocks.join("\n\n")}` };
   }
 
   const blocks = steps.map((s, i) => {
