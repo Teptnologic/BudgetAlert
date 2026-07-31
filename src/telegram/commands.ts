@@ -207,6 +207,23 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
       return;
     }
 
+    // Deterministic path for the common case, so a week's history costs no
+    // model call:  /history  ·  /history last  ·  /history 2
+    case "/history": {
+      const a = arg.trim().toLowerCase();
+      const offset = a.startsWith("last") ? 1 : Number.parseInt(a, 10) || 0;
+      const reply = await executeBatch(
+        env,
+        normalizeBatch({
+          actions: [
+            { action: "list_transactions", window: "week", period_offset: offset, scope: "main" },
+          ],
+        }),
+      );
+      await sendMessage(env, chat, reply.text);
+      return;
+    }
+
     case "/categories": {
       const cfg = await getConfig(env);
       const cats = await listCategories(env);
@@ -249,6 +266,7 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "/status — how much budget is left\n" +
           "/budget &lt;amount&gt; — set your main budget\n" +
           "/period weekly|monthly|yearly — set the budget window\n" +
+          "/history [last|N] — this week's spending, or N weeks back\n" +
           "/categories — list budget envelopes\n" +
           "/setgroup — send alerts &amp; summaries here\n" +
           "/help — this message\n\n" +
@@ -257,6 +275,7 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "<i>@bot move the last $200 charge into yearly gift budget</i>\n" +
           "<i>@bot create a yearly gift budget of 1200</i>\n" +
           "<i>@bot change the last charge to $48.60</i>\n" +
+          "<i>@bot show my spending last week</i>\n" +
           "<i>@bot how much did I spend on gifts this year?</i>",
       );
       return;

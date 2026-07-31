@@ -115,6 +115,25 @@ work exactly as before.
 
 ## Budget envelopes
 
+## Spending history
+
+`/history` lists this week's spending against the main budget; `/history last`
+steps back a week, `/history 3` three weeks. In natural language, *"show my
+spending last week"* does the same, and you can ask for a month, a year, or one
+envelope.
+
+```
+main budget — last week (week of 2026-07-20)
+07-22  $95.00 — PETROL
+07-23  $30.00 — CINEMA
+Total: $125.00 across 2 transactions
+```
+
+**Only main-budget spending is counted by default.** Because envelopes are
+exclusive, money filed into a named envelope isn't weekly spending — a $166.67
+water heater charged to the gift budget stays out of the weekly total. Ask for
+`everything` to see both together, or name an envelope to see just that one.
+
 Envelopes are **exclusive**: a transaction counts toward exactly one budget.
 Moving a $200 charge into `gift` removes it from your weekly budget, so weekly
 remaining goes *up* by $200. Uncategorized spend is the default budget.

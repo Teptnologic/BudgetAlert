@@ -294,8 +294,8 @@ async function planStep(
       return { ok: true, text: "Show budget status" };
     case "query_spend":
       return { ok: true, text: "Answer a spending question" };
-    case "list_recent":
-      return { ok: true, text: "List recent transactions" };
+    case "list_transactions":
+      return { ok: true, text: "List transactions" };
 
     default:
       return { ok: false, text: `⚠️ ${intent.reason || "I didn't follow that part."}` };

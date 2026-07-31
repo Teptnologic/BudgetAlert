@@ -113,6 +113,36 @@ export async function listSince(
   return res.results ?? [];
 }
 
+export type TxnScope = { kind: "main" } | { kind: "category"; id: number } | { kind: "all" };
+
+// Transactions inside a half-open range [since, until), oldest first so a
+// history reads as a chronology.
+//
+// scope 'main' means uncategorized only — envelopes are exclusive, so "my
+// weekly spending" is exactly the spend that hasn't been filed elsewhere.
+export async function listBetween(
+  env: Env,
+  sinceIso: string,
+  untilIso: string,
+  scope: TxnScope,
+): Promise<FullTxnRow[]> {
+  const cols = `SELECT id, amount, merchant, occurred_at, category_id FROM transactions`;
+  const range = `occurred_at >= ? AND occurred_at < ?`;
+  const order = `ORDER BY occurred_at ASC, id ASC`;
+
+  if (scope.kind === "category") {
+    const res = await env.DB.prepare(`${cols} WHERE ${range} AND category_id = ? ${order}`)
+      .bind(sinceIso, untilIso, scope.id)
+      .all<FullTxnRow>();
+    return res.results ?? [];
+  }
+  const filter = scope.kind === "main" ? " AND category_id IS NULL" : "";
+  const res = await env.DB.prepare(`${cols} WHERE ${range}${filter} ${order}`)
+    .bind(sinceIso, untilIso)
+    .all<FullTxnRow>();
+  return res.results ?? [];
+}
+
 export async function getSentAlerts(env: Env, periodStartIso: string): Promise<Set<AlertLevel>> {
   const res = await env.DB.prepare(
     `SELECT level FROM alerts_sent WHERE period_start = ?`,

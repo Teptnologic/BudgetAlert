@@ -24,6 +24,35 @@ export function periodStart(period: Period, now: Date = new Date()): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 }
 
+// Start of a period `offset` periods before the current one.
+// offset 0 = this week/month/year, 1 = the previous one, and so on.
+export function periodStartAt(period: Period, offset: number, now: Date = new Date()): Date {
+  const back = Math.max(0, Math.trunc(offset));
+  if (period === "weekly") {
+    const d = periodStart("weekly", now);
+    d.setUTCDate(d.getUTCDate() - back * 7);
+    return d;
+  }
+  if (period === "yearly") {
+    return new Date(Date.UTC(now.getUTCFullYear() - back, 0, 1));
+  }
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1));
+}
+
+// Exclusive end of the period beginning at `start` — the instant the next one
+// opens, so a range query is `>= start AND < end`.
+export function periodEnd(period: Period, start: Date): Date {
+  if (period === "weekly") {
+    const d = new Date(start);
+    d.setUTCDate(d.getUTCDate() + 7);
+    return d;
+  }
+  if (period === "yearly") {
+    return new Date(Date.UTC(start.getUTCFullYear() + 1, 0, 1));
+  }
+  return new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1));
+}
+
 export function periodLabel(period: Period, start: Date): string {
   if (period === "weekly") {
     return `week of ${start.toISOString().slice(0, 10)}`;

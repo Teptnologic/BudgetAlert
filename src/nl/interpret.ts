@@ -40,8 +40,13 @@ function systemPrompt(ctx: InterpretContext): string {
         .join("\n")
     : "(none yet)";
 
+  const today = new Date();
+  const weekday = today.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+
   return [
     "You classify messages sent to a personal budget bot into a single structured intent.",
+    "",
+    `Today is ${weekday}, ${today.toISOString().slice(0, 10)} (UTC). Budget weeks run Monday to Sunday.`,
     "",
     "Existing budget categories (envelopes):",
     cats,
@@ -72,6 +77,17 @@ function systemPrompt(ctx: InterpretContext): string {
     "- If the message is ambiguous, off-topic, or you would have to guess at an amount",
     "  or a category, return a single action 'unknown' with a short reason. Guessing moves",
     "  the user's money to the wrong place; asking is always cheaper.",
+    "",
+    "Spending history:",
+    "- list_transactions shows a history. Set window to 'week', 'month', or 'year' for a",
+    "  whole calendar period, with period_offset 0 for the current one, 1 for the",
+    "  previous, and so on. 'my spending this week' → window 'week', period_offset 0;",
+    "  'last week' → period_offset 1. Use window 'none' with limit N for a plain",
+    "  'show my last N transactions' with no date range.",
+    "- scope decides what counts. 'main' is the main weekly budget on its own and is the",
+    "  right default — money filed into a named envelope is not weekly spending. Use",
+    "  'category' with a category name when they ask about one envelope, and 'all' only",
+    "  when they explicitly want everything together.",
     "",
     "Multiple actions:",
     `- Return one action per distinct thing the user asked for, at most ${MAX_ACTIONS},`,

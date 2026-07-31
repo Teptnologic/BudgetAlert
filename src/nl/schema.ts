@@ -32,6 +32,8 @@ const ACTION_SCHEMA = {
     "days_ago",
     "period",
     "window",
+    "period_offset",
+    "scope",
     "selector_kind",
     "selector_value",
     "limit",
@@ -43,7 +45,7 @@ const ACTION_SCHEMA = {
       enum: [
         "get_status",
         "query_spend",
-        "list_recent",
+        "list_transactions",
         "add_transaction",
         "move_transaction",
         "set_transaction_amount",
@@ -92,7 +94,19 @@ const ACTION_SCHEMA = {
     window: {
       type: "string",
       enum: ["week", "month", "year", "none"],
-      description: "Look-back window for query_spend. 'none' when not applicable.",
+      description:
+        "Time window for query_spend and list_transactions. For list_transactions, 'week' means one calendar week (Monday to Sunday). Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
+    },
+    period_offset: {
+      type: "integer",
+      description:
+        "Which window, counting back from the current one: 0 = this week/month/year, 1 = last, 2 = the one before. Use 0 unless the user asks for an earlier one.",
+    },
+    scope: {
+      type: "string",
+      enum: ["main", "category", "all"],
+      description:
+        "Which spending to include. 'main' = only the main budget, excluding money filed to a named envelope — this is what 'my weekly spending' means. 'category' = only the envelope named in category. 'all' = everything. Default to 'main'.",
     },
     selector_kind: {
       type: "string",
@@ -143,7 +157,7 @@ export const ACTION_ITEM_SCHEMA = ACTION_SCHEMA;
 export type Action =
   | "get_status"
   | "query_spend"
-  | "list_recent"
+  | "list_transactions"
   | "add_transaction"
   | "move_transaction"
   | "set_transaction_amount"
@@ -154,6 +168,7 @@ export type Action =
 
 export type SelectorKind = "last" | "amount" | "merchant" | "none";
 export type Window = "week" | "month" | "year" | "none";
+export type Scope = "main" | "category" | "all";
 export type PeriodOrNone = "weekly" | "monthly" | "yearly" | "none";
 
 // The normalized, trusted shape the rest of the app works with.
@@ -167,6 +182,8 @@ export interface Intent {
   daysAgo: number;
   period: PeriodOrNone;
   window: Window;
+  periodOffset: number;
+  scope: Scope;
   selectorKind: SelectorKind;
   selectorValue: string;
   limit: number;
@@ -191,6 +208,7 @@ const ACTIONS = new Set(ACTION_SCHEMA.properties.action.enum as readonly string[
 const PERIODS = new Set(ACTION_SCHEMA.properties.period.enum as readonly string[]);
 const WINDOWS = new Set(ACTION_SCHEMA.properties.window.enum as readonly string[]);
 const SELECTORS = new Set(ACTION_SCHEMA.properties.selector_kind.enum as readonly string[]);
+const SCOPES = new Set(ACTION_SCHEMA.properties.scope.enum as readonly string[]);
 
 // Structured outputs constrain which enum value is chosen but NOT its
 // capitalization, so every enum comparison here is case-insensitive. Anything
@@ -237,6 +255,14 @@ export function normalizeIntent(raw: unknown): Intent {
     daysAgo: Math.min(365, Math.max(0, Math.trunc(num(either("days_ago", "daysAgo"))))),
     period: pickEnum<PeriodOrNone>(o.period, PERIODS, "none"),
     window: pickEnum<Window>(o.window, WINDOWS, "none"),
+    // Bounded: an unbounded offset would silently query an empty range far in
+    // the past and read as "you spent nothing" rather than as a bad request.
+    periodOffset: Math.min(520, Math.max(0, Math.trunc(num(either("period_offset", "periodOffset"))))),
+    // A named category implies category scope even if the model didn't say so.
+    scope: (() => {
+      const s = pickEnum<Scope>(o.scope, SCOPES, "main");
+      return s === "main" && str(o.category) ? "category" : s;
+    })(),
     selectorKind: pickEnum<SelectorKind>(either("selector_kind", "selectorKind"), SELECTORS, "none"),
     selectorValue: str(either("selector_value", "selectorValue")),
     limit: Math.min(20, Math.max(0, Math.trunc(num(o.limit)))),

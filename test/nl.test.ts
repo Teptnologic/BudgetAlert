@@ -11,7 +11,7 @@ import {
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
 import { executeBatch } from "../src/nl/execute";
-import { periodStart, periodLabel, isPeriod } from "../src/core/period";
+import { periodStart, periodStartAt, periodEnd, periodLabel, isPeriod } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
 // `anyOf` or type arrays; exceeding the grammar's limits fails with
@@ -154,7 +154,7 @@ describe("batchMutates", () => {
   it("is false for a read-only batch", () => {
     expect(
       batchMutates(
-        normalizeBatch({ actions: [{ action: "get_status" }, { action: "list_recent" }] }),
+        normalizeBatch({ actions: [{ action: "get_status" }, { action: "list_transactions" }] }),
       ),
     ).toBe(false);
   });
@@ -300,7 +300,7 @@ describe("isMutating", () => {
     ] as const) {
       expect(isMutating(a)).toBe(true);
     }
-    for (const a of ["get_status", "query_spend", "list_recent", "unknown"] as const) {
+    for (const a of ["get_status", "query_spend", "list_transactions", "unknown"] as const) {
       expect(isMutating(a)).toBe(false);
     }
   });
@@ -734,6 +734,72 @@ describe("executeBatch", () => {
       }),
     );
     expect(reply.text).toContain("Bob &amp; &lt;b&gt;Sons&lt;/b&gt;");
+  });
+});
+
+describe("period offsets", () => {
+  // 2026-07-29 is a Wednesday; its week starts Monday 2026-07-27.
+  const now = new Date("2026-07-29T10:00:00Z");
+
+  it("walks back whole weeks", () => {
+    expect(periodStartAt("weekly", 0, now).toISOString().slice(0, 10)).toBe("2026-07-27");
+    expect(periodStartAt("weekly", 1, now).toISOString().slice(0, 10)).toBe("2026-07-20");
+    expect(periodStartAt("weekly", 3, now).toISOString().slice(0, 10)).toBe("2026-07-06");
+  });
+
+  it("walks back months and years", () => {
+    expect(periodStartAt("monthly", 1, now).toISOString().slice(0, 10)).toBe("2026-06-01");
+    expect(periodStartAt("yearly", 1, now).toISOString().slice(0, 10)).toBe("2025-01-01");
+  });
+
+  it("crosses a year boundary going back by month", () => {
+    const jan = new Date("2026-01-15T00:00:00Z");
+    expect(periodStartAt("monthly", 2, jan).toISOString().slice(0, 10)).toBe("2025-11-01");
+  });
+
+  it("treats a negative offset as the current period", () => {
+    expect(periodStartAt("weekly", -5, now).toISOString()).toBe(
+      periodStartAt("weekly", 0, now).toISOString(),
+    );
+  });
+
+  // The range must be half-open, or a transaction at midnight Monday lands in
+  // two weeks at once.
+  it("ends a period exactly where the next begins", () => {
+    const start = periodStartAt("weekly", 1, now);
+    expect(periodEnd("weekly", start).toISOString()).toBe(periodStartAt("weekly", 0, now).toISOString());
+    const m = periodStartAt("monthly", 0, now);
+    expect(periodEnd("monthly", m).toISOString().slice(0, 10)).toBe("2026-08-01");
+    const y = periodStartAt("yearly", 0, now);
+    expect(periodEnd("yearly", y).toISOString().slice(0, 10)).toBe("2027-01-01");
+  });
+});
+
+describe("scope", () => {
+  const scopeOf = (raw: any) => normalizeBatch({ actions: [raw] })[0].scope;
+
+  it("defaults to the main budget", () => {
+    expect(scopeOf({ action: "list_transactions" })).toBe("main");
+  });
+
+  // Envelopes are exclusive, so "my weekly spending" must exclude filed money.
+  it("keeps main scope distinct from all", () => {
+    expect(scopeOf({ action: "list_transactions", scope: "all" })).toBe("all");
+  });
+
+  it("infers category scope when a category is named", () => {
+    expect(scopeOf({ action: "list_transactions", category: "gift" })).toBe("category");
+  });
+
+  it("does not override an explicit all scope with a stray category", () => {
+    expect(scopeOf({ action: "list_transactions", scope: "all", category: "gift" })).toBe("all");
+  });
+
+  it("clamps a wild period offset", () => {
+    const off = (n: any) => normalizeBatch({ actions: [{ action: "list_transactions", period_offset: n }] })[0].periodOffset;
+    expect(off(99999)).toBe(520);
+    expect(off(-3)).toBe(0);
+    expect(off("2")).toBe(2);
   });
 });
 

@@ -6,10 +6,27 @@ import type { Env } from "../env";
 import type { Intent } from "./schema";
 import { isMutating, batchMutates } from "./schema";
 import { planBatch, applyBatch, type StepOutcome } from "./plan";
-import { isPeriod, periodStart, periodLabel, daysAgo, type Period } from "../core/period";
+import {
+  isPeriod,
+  periodStart,
+  periodStartAt,
+  periodEnd,
+  periodLabel,
+  daysAgo,
+  type Period,
+} from "../core/period";
 import { formatMoney } from "../core/engine";
 import { budgetStatusText } from "../service";
-import { getConfig, listCategories, findCategory, recentTransactions, sumSince } from "../store/d1";
+import {
+  getConfig,
+  listCategories,
+  findCategory,
+  recentTransactions,
+  listBetween,
+  sumSince,
+  type TxnScope,
+  type FullTxnRow,
+} from "../store/d1";
 
 export interface Reply {
   text: string;
@@ -60,21 +77,81 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
       return `Last ${days} days on ${scope}: <b>${formatMoney(spent, cfg.currency)}</b>`;
     }
 
-    case "list_recent": {
-      const rows = await recentTransactions(env, intent.limit || 5);
-      if (!rows.length) return "No transactions recorded yet.";
-      const cats = await listCategories(env);
-      const byId = new Map(cats.map((c) => [c.id, c.label]));
-      const lines = rows.map((r) => {
-        const where = r.category_id ? ` [${esc(byId.get(r.category_id) ?? "?")}]` : "";
-        return `• ${formatMoney(r.amount, cfg.currency)} — ${esc(r.merchant ?? "unknown")}${where}`;
-      });
-      return `<b>Recent transactions</b>\n${lines.join("\n")}`;
-    }
+    case "list_transactions":
+      return await listTransactions(env, intent, cfg.currency);
 
     default:
       return intent.reason || "I didn't follow that. Try /help for what I understand.";
   }
+}
+
+// Spending history. With a window it covers one whole calendar period (this
+// week, last week, …); without one it falls back to the most recent N.
+async function listTransactions(env: Env, intent: Intent, currency: string): Promise<string> {
+  const cats = await listCategories(env);
+  const byId = new Map(cats.map((c) => [c.id, c.label]));
+
+  // Resolve the scope first — asking for an envelope that doesn't exist should
+  // say so rather than quietly showing the main budget instead.
+  let scope: TxnScope = { kind: "main" };
+  let scopeLabel = "main budget";
+  if (intent.scope === "all") {
+    scope = { kind: "all" };
+    scopeLabel = "everything";
+  } else if (intent.scope === "category") {
+    const cat = cats.find((c) => c.name === intent.category);
+    if (!cat) return `I don't have a budget called <b>${esc(intent.category)}</b> yet.`;
+    scope = { kind: "category", id: cat.id };
+    scopeLabel = cat.label;
+  }
+
+  let rows: FullTxnRow[];
+  let heading: string;
+
+  if (intent.window === "none") {
+    const limit = intent.limit || 5;
+    const all = await recentTransactions(env, 50);
+    rows = all
+      .filter((r) =>
+        scope.kind === "all"
+          ? true
+          : scope.kind === "main"
+            ? r.category_id === null
+            : r.category_id === scope.id,
+      )
+      .slice(0, limit)
+      .reverse(); // oldest first, so it reads as a chronology
+    heading = `Last ${rows.length} on ${esc(scopeLabel)}`;
+  } else {
+    const period: Period =
+      intent.window === "year" ? "yearly" : intent.window === "month" ? "monthly" : "weekly";
+    const start = periodStartAt(period, intent.periodOffset);
+    const end = periodEnd(period, start);
+    rows = await listBetween(env, start.toISOString(), end.toISOString(), scope);
+    const when =
+      intent.periodOffset === 0
+        ? `this ${intent.window}`
+        : intent.periodOffset === 1
+          ? `last ${intent.window}`
+          : periodLabel(period, start);
+    heading = `${esc(scopeLabel)} — ${when} (${periodLabel(period, start)})`;
+  }
+
+  if (!rows.length) return `<b>${heading}</b>\nNothing recorded.`;
+
+  const total = rows.reduce((sum, r) => sum + r.amount, 0);
+  const lines = rows.map((r) => {
+    const day = r.occurred_at.slice(5, 10); // MM-DD
+    const tag =
+      scope.kind === "all" && r.category_id ? ` [${esc(byId.get(r.category_id) ?? "?")}]` : "";
+    return `${day}  ${formatMoney(r.amount, currency)} — ${esc(r.merchant ?? "unknown")}${tag}`;
+  });
+
+  return (
+    `<b>${heading}</b>\n` +
+    `<code>${lines.join("\n")}</code>\n` +
+    `<b>Total: ${formatMoney(total, currency)}</b> across ${rows.length} transaction${rows.length === 1 ? "" : "s"}`
+  );
 }
 
 async function readReplies(env: Env, intents: Intent[]): Promise<string> {
