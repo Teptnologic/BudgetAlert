@@ -3,6 +3,7 @@
 // message; the model never gets near D1.
 
 import type { Env } from "../env";
+import { calendarFrom } from "../env";
 import type { Intent } from "./schema";
 import { isMutating, batchMutates } from "./schema";
 import { planBatch, applyBatch, type StepOutcome } from "./plan";
@@ -48,6 +49,7 @@ function token(): string {
 
 async function readReply(env: Env, intent: Intent): Promise<string> {
   const cfg = await getConfig(env);
+  const cal = calendarFrom(env);
 
   switch (intent.action) {
     case "get_status": {
@@ -55,11 +57,11 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
       const cat = await findCategory(env, intent.category);
       if (!cat) return `I don't have a budget called <b>${esc(intent.category)}</b> yet.`;
       const period: Period = isPeriod(cat.period) ? cat.period : "yearly";
-      const start = periodStart(period);
+      const start = periodStart(period, new Date(), cal);
       const spent = await sumSince(env, start.toISOString(), cat.id);
       const remaining = cat.amount - spent;
       return (
-        `<b>${esc(cat.label)}</b> — ${periodLabel(period, start)}\n` +
+        `<b>${esc(cat.label)}</b> — ${periodLabel(period, start, cal)}\n` +
         `Spent: ${formatMoney(spent, cfg.currency)} of ${formatMoney(cat.amount, cfg.currency)}\n` +
         `Remaining: <b>${formatMoney(remaining, cfg.currency)}</b>`
       );
@@ -67,7 +69,7 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
 
     case "query_spend": {
       const days = intent.window === "year" ? 365 : intent.window === "month" ? 30 : 7;
-      const since = daysAgo(days).toISOString();
+      const since = daysAgo(days, new Date(), cal).toISOString();
       const cat = intent.category ? await findCategory(env, intent.category) : null;
       if (intent.category && !cat) {
         return `I don't have a budget called <b>${esc(intent.category)}</b> yet.`;
@@ -88,6 +90,7 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
 // Spending history. With a window it covers one whole calendar period (this
 // week, last week, …); without one it falls back to the most recent N.
 async function listTransactions(env: Env, intent: Intent, currency: string): Promise<string> {
+  const cal = calendarFrom(env);
   const cats = await listCategories(env);
   const byId = new Map(cats.map((c) => [c.id, c.label]));
 
@@ -125,23 +128,30 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
   } else {
     const period: Period =
       intent.window === "year" ? "yearly" : intent.window === "month" ? "monthly" : "weekly";
-    const start = periodStartAt(period, intent.periodOffset);
-    const end = periodEnd(period, start);
+    const start = periodStartAt(period, intent.periodOffset, new Date(), cal);
+    const end = periodEnd(period, start, cal);
     rows = await listBetween(env, start.toISOString(), end.toISOString(), scope);
     const when =
       intent.periodOffset === 0
         ? `this ${intent.window}`
         : intent.periodOffset === 1
           ? `last ${intent.window}`
-          : periodLabel(period, start);
-    heading = `${esc(scopeLabel)} — ${when} (${periodLabel(period, start)})`;
+          : periodLabel(period, start, cal);
+    heading = `${esc(scopeLabel)} — ${when} (${periodLabel(period, start, cal)})`;
   }
 
   if (!rows.length) return `<b>${heading}</b>\nNothing recorded.`;
 
   const total = rows.reduce((sum, r) => sum + r.amount, 0);
+  // Dates are stored as UTC instants but must READ as local days, or a Saturday
+  // evening in California prints as Sunday and contradicts the week it's in.
+  const dayFmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: cal.timeZone,
+    month: "2-digit",
+    day: "2-digit",
+  });
   const lines = rows.map((r) => {
-    const day = r.occurred_at.slice(5, 10); // MM-DD
+    const day = dayFmt.format(new Date(r.occurred_at));
     const tag =
       scope.kind === "all" && r.category_id ? ` [${esc(byId.get(r.category_id) ?? "?")}]` : "";
     return `${day}  ${formatMoney(r.amount, currency)} — ${esc(r.merchant ?? "unknown")}${tag}`;

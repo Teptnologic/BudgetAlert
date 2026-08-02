@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { computeStatus, alertsToFire } from "../src/core/engine";
-import { periodStart } from "../src/core/period";
+import { periodStart, type Calendar } from "../src/core/period";
 
 describe("computeStatus", () => {
   it("computes remaining and pct", () => {
@@ -43,19 +43,31 @@ describe("alertsToFire", () => {
 });
 
 describe("periodStart", () => {
-  it("monthly returns first of month UTC", () => {
-    const s = periodStart("monthly", new Date("2026-07-19T10:00:00Z"));
-    expect(s.toISOString()).toBe("2026-07-01T00:00:00.000Z");
+  // Periods are computed in the configured zone (US Pacific) with weeks
+  // beginning Sunday, so these assert local calendar boundaries, not UTC ones.
+  const PT: Calendar = { timeZone: "America/Los_Angeles", weekStartsOn: 0 };
+  const localDay = (d: Date) =>
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: PT.timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(d);
+
+  it("monthly returns the first of the local month", () => {
+    expect(localDay(periodStart("monthly", new Date("2026-07-19T17:00:00Z"), PT))).toBe("2026-07-01");
   });
 
-  it("weekly returns the Monday", () => {
-    // 2026-07-19 is a Sunday → previous Monday is 2026-07-13
-    const s = periodStart("weekly", new Date("2026-07-19T10:00:00Z"));
-    expect(s.toISOString()).toBe("2026-07-13T00:00:00.000Z");
+  it("weekly returns the Sunday", () => {
+    // 2026-07-19 is a Sunday, so it is itself the start of the week.
+    expect(localDay(periodStart("weekly", new Date("2026-07-19T17:00:00Z"), PT))).toBe("2026-07-19");
   });
 
-  it("weekly on a Monday returns that same day", () => {
-    const s = periodStart("weekly", new Date("2026-07-13T23:00:00Z"));
-    expect(s.toISOString()).toBe("2026-07-13T00:00:00.000Z");
+  it("weekly mid-week rolls back to the preceding Sunday", () => {
+    expect(localDay(periodStart("weekly", new Date("2026-07-22T17:00:00Z"), PT))).toBe("2026-07-19");
+  });
+
+  it("weekly on a Saturday stays in the week that began Sunday", () => {
+    expect(localDay(periodStart("weekly", new Date("2026-07-25T23:00:00Z"), PT))).toBe("2026-07-19");
   });
 });

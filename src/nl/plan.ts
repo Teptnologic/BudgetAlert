@@ -11,6 +11,7 @@
 // considered.
 
 import type { Env } from "../env";
+import { calendarFrom } from "../env";
 import type { Intent } from "./schema";
 import { isMutating } from "./schema";
 import { isPeriod, daysAgo, type Period } from "../core/period";
@@ -335,7 +336,7 @@ async function applyStep(
         categoryId = cat.id;
         where = ` to <b>${esc(cat.label)}</b>`;
       }
-      const occurredAt = daysAgo(intent.daysAgo).toISOString();
+      const occurredAt = daysAgo(intent.daysAgo, new Date(), calendarFrom(env)).toISOString();
       await addManualTransaction(
         env,
         intent.amount,

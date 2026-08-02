@@ -3,9 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Weekly summary — Monday 09:00 UTC. Adjust to your timezone/cadence.
+# Weekly summary — Sunday 16:00 UTC, which is 9am Pacific during daylight
+# saving and 8am in winter. Cron is always UTC, so the local hour shifts by one
+# across DST; that's cosmetic for a summary. Sunday morning is chosen so the
+# digest covers the week that just ended, given weeks now begin Sunday.
 [triggers]
-crons = ["0 9 * * 1"]
+crons = ["0 16 * * 0"]
 
 # D1 database. Create it with:  wrangler d1 create budgetalert
 # then paste the returned database_id below.
@@ -29,3 +32,9 @@ TELEGRAM_BOT_USERNAME = "REPLACE_WITH_YOUR_BOT_USERNAME"
 # grammars are cached only ~24h from last use, so a low-traffic bot would often
 # pay compile latency on Opus for no accuracy gain.
 NL_MODEL = "claude-sonnet-5"
+# Budget periods are computed in this zone, with daylight saving handled. Set it
+# to where you actually spend money — on UTC, a Saturday-night dinner in
+# California is already Sunday and lands in the wrong week.
+TIMEZONE = "America/Los_Angeles"
+# "sunday" or "monday" — which day a budget week begins on.
+WEEK_START = "sunday"

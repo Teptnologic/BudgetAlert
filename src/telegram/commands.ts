@@ -12,6 +12,7 @@
 //   /help                            → command list
 
 import type { Env } from "../env";
+import { calendarFrom } from "../env";
 import {
   setBudget,
   setGroupChat,
@@ -238,7 +239,7 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
       const lines: string[] = [];
       for (const c of cats) {
         const period = isPeriod(c.period) ? c.period : "yearly";
-        const spent = await sumSince(env, periodStart(period).toISOString(), c.id);
+        const spent = await sumSince(env, periodStart(period, new Date(), calendarFrom(env)).toISOString(), c.id);
         lines.push(
           `• <b>${c.label}</b> — ${formatMoney(spent, cfg.currency)} of ` +
             `${formatMoney(c.amount, cfg.currency)} per ${period}`,

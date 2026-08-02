@@ -224,6 +224,8 @@ inbox).
 | `ALERT_PCT` | `100` | Second alert at this % of budget |
 | `CURRENCY` | `USD` | Default currency when an alert omits one |
 | `BUDGET_PERIOD` | `weekly` | `weekly`, `monthly`, or `yearly` budget window |
+| `TIMEZONE` | `America/Los_Angeles` | IANA zone all budget periods are computed in |
+| `WEEK_START` | `sunday` | `sunday` or `monday` — which day a budget week begins |
 | `TELEGRAM_BOT_USERNAME` | — | Your bot's handle, for @mention detection |
 | `NL_MODEL` | `claude-sonnet-5` | Model used to parse natural language |
 
@@ -232,7 +234,17 @@ extraction on a latency-sensitive webhook path, and compiled grammars are cached
 only ~24h from last use — a low-traffic personal bot would often pay Opus
 compile latency for no accuracy gain. Switch it if you disagree.
 
-Weekly-summary schedule lives in `[triggers] crons` (default: Monday 09:00 UTC).
+Weekly-summary schedule lives in `[triggers] crons` (default: Sunday 16:00 UTC —
+9am Pacific in summer, 8am in winter, since cron is always UTC).
+
+### Weeks and timezones
+
+Budget periods are computed in `TIMEZONE`, **not UTC**, and weeks begin on
+`WEEK_START`. This is not cosmetic: on UTC, a Saturday-evening dinner in
+California is already Sunday, so it would file into the following week and
+vanish from the week you actually spent it. Daylight saving is handled — period
+boundaries land on local midnight on both sides of a change, not 168 hours
+apart — and transaction dates are displayed as local days for the same reason.
 
 ## Adding a bank
 

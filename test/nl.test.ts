@@ -11,7 +11,7 @@ import {
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
 import { executeBatch } from "../src/nl/execute";
-import { periodStart, periodStartAt, periodEnd, periodLabel, isPeriod } from "../src/core/period";
+import { periodStart, periodStartAt, periodEnd, periodLabel, daysAgo, isPeriod, type Calendar } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
 // `anyOf` or type arrays; exceeding the grammar's limits fails with
@@ -737,41 +737,114 @@ describe("executeBatch", () => {
   });
 });
 
-describe("period offsets", () => {
-  // 2026-07-29 is a Wednesday; its week starts Monday 2026-07-27.
-  const now = new Date("2026-07-29T10:00:00Z");
+// The configured calendar: weeks begin Sunday, computed in US Pacific.
+const PT: Calendar = { timeZone: "America/Los_Angeles", weekStartsOn: 0 };
 
-  it("walks back whole weeks", () => {
-    expect(periodStartAt("weekly", 0, now).toISOString().slice(0, 10)).toBe("2026-07-27");
-    expect(periodStartAt("weekly", 1, now).toISOString().slice(0, 10)).toBe("2026-07-20");
-    expect(periodStartAt("weekly", 3, now).toISOString().slice(0, 10)).toBe("2026-07-06");
+// Local wall-clock rendering of an instant, for readable assertions.
+const inPT = (d: Date) =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: PT.timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .format(d)
+    .replace(",", "");
+
+describe("period offsets (Sunday weeks, US Pacific)", () => {
+  // 2026-07-29 is a Wednesday; with Sunday weeks its week starts 2026-07-26.
+  const now = new Date("2026-07-29T17:00:00Z"); // 10:00 PDT
+
+  it("starts the week on Sunday", () => {
+    expect(inPT(periodStartAt("weekly", 0, now, PT))).toBe("2026-07-26 00:00");
+    expect(inPT(periodStartAt("weekly", 1, now, PT))).toBe("2026-07-19 00:00");
+    expect(inPT(periodStartAt("weekly", 3, now, PT))).toBe("2026-07-05 00:00");
+  });
+
+  it("keeps Sunday itself as the first day, not the last", () => {
+    const sunday = new Date("2026-08-02T18:00:00Z"); // Sunday 11:00 PDT
+    expect(inPT(periodStartAt("weekly", 0, sunday, PT))).toBe("2026-08-02 00:00");
+  });
+
+  it("still supports Monday weeks when configured", () => {
+    const monday: Calendar = { ...PT, weekStartsOn: 1 };
+    expect(inPT(periodStartAt("weekly", 0, now, monday))).toBe("2026-07-27 00:00");
   });
 
   it("walks back months and years", () => {
-    expect(periodStartAt("monthly", 1, now).toISOString().slice(0, 10)).toBe("2026-06-01");
-    expect(periodStartAt("yearly", 1, now).toISOString().slice(0, 10)).toBe("2025-01-01");
+    expect(inPT(periodStartAt("monthly", 1, now, PT))).toBe("2026-06-01 00:00");
+    expect(inPT(periodStartAt("yearly", 1, now, PT))).toBe("2025-01-01 00:00");
   });
 
   it("crosses a year boundary going back by month", () => {
-    const jan = new Date("2026-01-15T00:00:00Z");
-    expect(periodStartAt("monthly", 2, jan).toISOString().slice(0, 10)).toBe("2025-11-01");
+    const jan = new Date("2026-01-15T20:00:00Z");
+    expect(inPT(periodStartAt("monthly", 2, jan, PT))).toBe("2025-11-01 00:00");
   });
 
   it("treats a negative offset as the current period", () => {
-    expect(periodStartAt("weekly", -5, now).toISOString()).toBe(
-      periodStartAt("weekly", 0, now).toISOString(),
+    expect(periodStartAt("weekly", -5, now, PT).toISOString()).toBe(
+      periodStartAt("weekly", 0, now, PT).toISOString(),
     );
   });
 
-  // The range must be half-open, or a transaction at midnight Monday lands in
-  // two weeks at once.
+  // Half-open, or a transaction at local midnight Sunday lands in two weeks.
   it("ends a period exactly where the next begins", () => {
-    const start = periodStartAt("weekly", 1, now);
-    expect(periodEnd("weekly", start).toISOString()).toBe(periodStartAt("weekly", 0, now).toISOString());
-    const m = periodStartAt("monthly", 0, now);
-    expect(periodEnd("monthly", m).toISOString().slice(0, 10)).toBe("2026-08-01");
-    const y = periodStartAt("yearly", 0, now);
-    expect(periodEnd("yearly", y).toISOString().slice(0, 10)).toBe("2027-01-01");
+    const start = periodStartAt("weekly", 1, now, PT);
+    expect(periodEnd("weekly", start, PT).toISOString()).toBe(
+      periodStartAt("weekly", 0, now, PT).toISOString(),
+    );
+    expect(inPT(periodEnd("monthly", periodStartAt("monthly", 0, now, PT), PT))).toBe(
+      "2026-08-01 00:00",
+    );
+    expect(inPT(periodEnd("yearly", periodStartAt("yearly", 0, now, PT), PT))).toBe(
+      "2027-01-01 00:00",
+    );
+  });
+});
+
+describe("timezone correctness", () => {
+  // The bug that motivated this: on UTC, a Saturday-evening purchase in
+  // California is already Sunday and would file into the following week.
+  it("keeps a Saturday-night purchase in the week it was spent", () => {
+    const satNight = new Date("2026-08-02T02:00:00Z"); // Sat 19:00 PDT
+    const start = periodStartAt("weekly", 0, satNight, PT);
+    expect(inPT(start)).toBe("2026-07-26 00:00");
+    expect(satNight >= start).toBe(true);
+    expect(satNight < periodEnd("weekly", start, PT)).toBe(true);
+  });
+
+  it("puts local midnight Sunday in the new week, not the old one", () => {
+    const justAfter = new Date("2026-08-02T07:00:01Z"); // 00:00:01 PDT Sunday
+    expect(inPT(periodStartAt("weekly", 0, justAfter, PT))).toBe("2026-08-02 00:00");
+  });
+
+  // Week boundaries must be local midnight on both sides of a DST change, not
+  // a fixed 168 hours apart.
+  it("lands on local midnight across the spring-forward week", () => {
+    const afterSpring = new Date("2026-03-10T19:00:00Z"); // Tue after DST starts
+    for (let i = 0; i < 3; i++) {
+      expect(inPT(periodStartAt("weekly", i, afterSpring, PT)).slice(-5)).toBe("00:00");
+    }
+    // The week containing the change is still exactly one week long, locally.
+    const spanning = periodStartAt("weekly", 1, afterSpring, PT); // week of Mar 1
+    expect(inPT(spanning)).toBe("2026-03-01 00:00");
+    expect(inPT(periodEnd("weekly", spanning, PT))).toBe("2026-03-08 00:00");
+  });
+
+  it("lands on local midnight across the fall-back week", () => {
+    const afterFall = new Date("2026-11-03T20:00:00Z");
+    const spanning = periodStartAt("weekly", 0, afterFall, PT);
+    expect(inPT(spanning)).toBe("2026-11-01 00:00");
+    expect(inPT(periodEnd("weekly", spanning, PT))).toBe("2026-11-08 00:00");
+  });
+
+  it("resolves 'yesterday' by local date, not by subtracting 24 hours", () => {
+    const early = new Date("2026-08-02T08:00:00Z"); // Sun 01:00 PDT
+    expect(inPT(daysAgo(1, early, PT))).toBe("2026-08-01 00:00");
+    expect(inPT(daysAgo(0, early, PT))).toBe("2026-08-02 00:00");
   });
 });
 
@@ -804,14 +877,12 @@ describe("scope", () => {
 });
 
 describe("yearly period", () => {
-  it("starts on Jan 1 UTC", () => {
-    expect(periodStart("yearly", new Date("2026-07-27T10:00:00Z")).toISOString()).toBe(
-      "2026-01-01T00:00:00.000Z",
-    );
+  it("starts on Jan 1, local time", () => {
+    expect(inPT(periodStart("yearly", new Date("2026-07-27T17:00:00Z"), PT))).toBe("2026-01-01 00:00");
   });
 
   it("labels as the year", () => {
-    expect(periodLabel("yearly", new Date("2026-01-01T00:00:00Z"))).toBe("2026");
+    expect(periodLabel("yearly", periodStart("yearly", new Date("2026-07-27T17:00:00Z"), PT), PT)).toBe("2026");
   });
 
   it("recognizes all three periods and rejects others", () => {
