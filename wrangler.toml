@@ -8,14 +8,14 @@ compatibility_flags = ["nodejs_compat"]
 # across DST; that's cosmetic for a summary. Sunday morning is chosen so the
 # digest covers the week that just ended, given weeks now begin Sunday.
 [triggers]
-crons = ["0 16 * * 0"]
+crons = ["0 16 * * SUN"]
 
 # D1 database. Create it with:  wrangler d1 create budgetalert
 # then paste the returned database_id below.
 [[d1_databases]]
 binding = "DB"
 database_name = "budgetalert"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "631163d4-55eb-4c0f-9e09-936a482a30be"
 
 # Non-secret defaults. Secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET)
 # are set with `wrangler secret put <NAME>` — never commit them.
@@ -26,7 +26,7 @@ CURRENCY = "USD"
 BUDGET_PERIOD = "weekly"
 # Your bot's @handle without the @, e.g. "budgetalert_bot". Required for the
 # natural-language path — it's how the Worker knows it was addressed.
-TELEGRAM_BOT_USERNAME = "REPLACE_WITH_YOUR_BOT_USERNAME"
+TELEGRAM_BOT_USERNAME = "SpendingNotifyBot"
 # Model for parsing natural-language messages. Sonnet 5 is a deliberate default
 # over Opus 5: bounded extraction on a latency-sensitive webhook, and compiled
 # grammars are cached only ~24h from last use, so a low-traffic bot would often
