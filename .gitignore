@@ -1,6 +1,10 @@
 node_modules/
 .wrangler/
+# Local secrets. Wrangler reads .dev.vars, and v4 also looks for .env — neither
+# may ever be committed; production values go in `wrangler secret put`.
 .dev.vars
+.env
+.env.*
 dist/
 *.log
 .DS_Store

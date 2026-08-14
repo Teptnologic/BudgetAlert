@@ -7,6 +7,8 @@ against a budget, and:
 - 🚨 **Alerts** a Telegram group the moment you cross a threshold (e.g. 80% and 100%)
 - 📊 Posts a **weekly summary** on a schedule
 - 💬 Answers **on-demand checks** — message `/status` in the group to see what's left
+- 🗂 Tracks **budget envelopes** — a yearly gift budget separate from your weekly spend
+- 🗣 Understands **plain English** — `@bot move the last $200 charge into yearly gift budget`
 
 No bank credentials, no Plaid, nothing to poll. Bank alert → email → Worker.
 
@@ -39,9 +41,105 @@ different chat platform later means swapping an adapter, not a rewrite.
 | `src/store/d1.ts` | D1 data layer (the only DB-specific module) |
 | `src/notify/telegram.ts` | Delivery channel |
 | `src/email/inbound.ts` | Cloudflare Email Worker handler |
-| `src/telegram/commands.ts` | `/status`, `/budget`, `/setgroup`, `/help` |
+| `src/telegram/commands.ts` | Slash commands, @mention routing, confirmation taps |
+| `src/nl/schema.ts` | Intent JSON schema + normalization |
+| `src/nl/interpret.ts` | Claude API call — classification only, never touches D1 |
+| `src/nl/execute.ts` | Intent → typed handlers, confirm-then-apply |
 | `src/router.ts` | HTTP routes: `/telegram`, `/inbound`, health |
 | `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` |
+
+## Natural language
+
+@-mention the bot in the group (or reply to one of its messages) and say what you
+mean:
+
+```
+@budgetbot I spent $12 on lunch yesterday
+@budgetbot move the last $200 charge into yearly gift budget
+@budgetbot create a yearly gift budget of 1200
+@budgetbot change the last charge to $48.60
+@budgetbot how much did I spend on gifts this year?
+@budgetbot set my weekly budget to 400
+```
+
+Every confirmation spells out how the message was understood, field by field, so
+a misparse is visible before you approve it rather than after:
+
+```
+Confirm this?
+
+Add transaction
+Amount    $12.00
+Merchant  lunch
+When      Yesterday
+Budget    Main budget
+                          [✅ Yes]  [✖️ No]
+```
+
+A batch numbers each step the same way. The fields matter most where two similar
+numbers appear in one sentence — "change the $84 charge to $48" renders as
+`Which charge → The $84.00 charge` and `New amount → $48.60`, so a swap is
+obvious at a glance.
+
+`add_transaction` covers spending the bank never emails about — cash, a split
+bill, a card whose alerts aren't wired up. It records against today unless you
+say otherwise ("yesterday", "3 days ago"), and can file straight into an
+envelope.
+
+One message can carry several actions, and later ones can depend on earlier ones
+— *"create a yearly gift budget of 1200 and move the last $200 charge into it"*
+is planned as two steps and confirmed together. If any step is invalid, none of
+them run.
+
+Correcting an amount (`change the last charge to $48.60`) is for when the captured
+figure is wrong — bank alerts frequently land pre-tip. Budget totals are summed
+live, so every status recomputes on the next read.
+
+Anything that changes data shows a summary with **Yes / No** buttons and only
+applies on tap, so a misread amount can't silently move money.
+
+**How it's kept safe:** the model only classifies a message into a structured
+intent (`{action, category, amount, …}`). It never writes SQL and never sees the
+database — execution runs through typed handlers in `src/nl/execute.ts`. A
+misparse can produce a wrong-but-valid action, never an arbitrary one.
+
+The intent schema is deliberately **one flat object with every field required and
+no unions**. The API caps a request at 24 optional parameters and 16 using
+`anyOf`/type arrays; over the grammar's limits it returns a 400 "Schema is too
+complex for compilation" — which would land on a user's message, not at build
+time. `test/nl.test.ts` asserts those counts so a future field can't quietly push
+it over.
+
+Natural language is **optional**. Without `ANTHROPIC_API_KEY` the slash commands
+work exactly as before.
+
+## Budget envelopes
+
+## Spending history
+
+`/history` lists this week's spending against the main budget; `/history last`
+steps back a week, `/history 3` three weeks. In natural language, *"show my
+spending last week"* does the same, and you can ask for a month, a year, or one
+envelope.
+
+```
+main budget — last week (week of 2026-07-20)
+07-22  $95.00 — PETROL
+07-23  $30.00 — CINEMA
+Total: $125.00 across 2 transactions
+```
+
+**Only main-budget spending is counted by default.** Because envelopes are
+exclusive, money filed into a named envelope isn't weekly spending — a $166.67
+water heater charged to the gift budget stays out of the weekly total. Ask for
+`everything` to see both together, or name an envelope to see just that one.
+
+Envelopes are **exclusive**: a transaction counts toward exactly one budget.
+Moving a $200 charge into `gift` removes it from your weekly budget, so weekly
+remaining goes *up* by $200. Uncategorized spend is the default budget.
+
+Threshold alerts fire on the default envelope only — a yearly gift budget
+shouldn't trip a weekly warning. `/categories` lists envelopes and their spend.
 
 ## Setup
 
@@ -60,13 +158,25 @@ npx wrangler d1 create budgetalert
 npm run db:init          # applies schema.sql to the remote DB
 ```
 
+> **Upgrading an existing database?** `db:init` is re-runnable but won't add the
+> new columns. Run the migration once instead:
+> ```bash
+> npm run db:migrate          # adds categories, transactions.category_id, pending_actions
+> ```
+> It is *not* idempotent (`ALTER TABLE ADD COLUMN`) — run it exactly once.
+
 ### 3. Create a Telegram bot
 
 1. Message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
-2. Store secrets:
+2. Send BotFather `/setprivacy` → your bot → **Disable**, so it can read group
+   messages that mention it.
+3. Put your bot's handle in `wrangler.toml` as `TELEGRAM_BOT_USERNAME` (without
+   the `@`) — that's how the Worker knows it was addressed.
+4. Store secrets:
    ```bash
    npx wrangler secret put TELEGRAM_BOT_TOKEN
    npx wrangler secret put TELEGRAM_WEBHOOK_SECRET   # any long random string
+   npx wrangler secret put ANTHROPIC_API_KEY         # optional — enables @mentions
    ```
 
 ### 4. Deploy
@@ -113,9 +223,28 @@ inbox).
 | `WARN_PCT` | `80` | First alert at this % of budget |
 | `ALERT_PCT` | `100` | Second alert at this % of budget |
 | `CURRENCY` | `USD` | Default currency when an alert omits one |
-| `BUDGET_PERIOD` | `monthly` | `monthly` or `weekly` budget window |
+| `BUDGET_PERIOD` | `weekly` | `weekly`, `monthly`, or `yearly` budget window |
+| `TIMEZONE` | `America/Los_Angeles` | IANA zone all budget periods are computed in |
+| `WEEK_START` | `sunday` | `sunday` or `monday` — which day a budget week begins |
+| `TELEGRAM_BOT_USERNAME` | — | Your bot's handle, for @mention detection |
+| `NL_MODEL` | `claude-sonnet-5` | Model used to parse natural language |
 
-Weekly-summary schedule lives in `[triggers] crons` (default: Monday 09:00 UTC).
+`NL_MODEL` defaults to Sonnet 5 rather than Opus 5 on purpose: this is bounded
+extraction on a latency-sensitive webhook path, and compiled grammars are cached
+only ~24h from last use — a low-traffic personal bot would often pay Opus
+compile latency for no accuracy gain. Switch it if you disagree.
+
+Weekly-summary schedule lives in `[triggers] crons` (default: Sunday 16:00 UTC —
+9am Pacific in summer, 8am in winter, since cron is always UTC).
+
+### Weeks and timezones
+
+Budget periods are computed in `TIMEZONE`, **not UTC**, and weeks begin on
+`WEEK_START`. This is not cosmetic: on UTC, a Saturday-evening dinner in
+California is already Sunday, so it would file into the following week and
+vanish from the week you actually spent it. Daylight saving is handled — period
+boundaries land on local midnight on both sides of a change, not 168 hours
+apart — and transaction dates are displayed as local days for the same reason.
 
 ## Adding a bank
 

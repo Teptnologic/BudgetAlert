@@ -9,7 +9,11 @@ import { handleTelegramUpdate } from "./telegram/commands";
 import { parseTransaction } from "./core/parser";
 import { recordAndEvaluate } from "./service";
 
-export async function handleFetch(request: Request, env: Env): Promise<Response> {
+export async function handleFetch(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/") {
@@ -26,13 +30,16 @@ export async function handleFetch(request: Request, env: Env): Promise<Response>
     }
     const update = await request.json().catch(() => null);
     if (update) {
-      try {
-        await handleTelegramUpdate(update, env);
-      } catch (err) {
-        // Log for `wrangler tail` but still return 200, so Telegram doesn't
-        // retry the same failing update forever.
-        console.error("telegram handler error:", err);
-      }
+      // Ack immediately and finish the work in the background. A natural-
+      // language message costs a model round trip, which can outlast Telegram's
+      // webhook timeout — a slow reply would otherwise be retried as a new
+      // update and processed twice.
+      ctx.waitUntil(
+        handleTelegramUpdate(update, env).catch((err) => {
+          // Logged for `wrangler tail`; the 200 below has already been sent.
+          console.error("telegram handler error:", err);
+        }),
+      );
     }
     return new Response("ok", { status: 200 });
   }

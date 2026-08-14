@@ -2,9 +2,10 @@
 // webhook, and the Telegram commands. Ties the pure core to storage + delivery.
 
 import type { Env } from "./env";
+import { calendarFrom } from "./env";
 import type { ParsedTxn } from "./core/parser";
-import type { Period } from "./core/period";
-import { periodStart, periodLabel, daysAgo } from "./core/period";
+import type { Period, Calendar } from "./core/period";
+import { periodStart, periodLabel, daysAgo, isPeriod } from "./core/period";
 import {
   computeStatus,
   alertsToFire,
@@ -18,6 +19,7 @@ import {
   listSince,
   getSentAlerts,
   markAlertSent,
+  listCategories,
 } from "./store/d1";
 import { sendMessage } from "./notify/telegram";
 
@@ -36,6 +38,7 @@ export async function recordAndEvaluate(
   source: string,
 ): Promise<void> {
   const cfg = await getConfig(env);
+  const cal = calendarFrom(env);
   const currency = parsed.currency ?? cfg.currency;
 
   const rawHash = await sha256Hex(
@@ -53,7 +56,7 @@ export async function recordAndEvaluate(
 
   if (!cfg.group_chat_id || cfg.budget_amount <= 0) return; // nothing to alert to
 
-  const start = periodStart(cfg.period as Period);
+  const start = periodStart(cfg.period as Period, new Date(), cal);
   const startIso = start.toISOString();
   const spent = await sumSince(env, startIso);
   const status = computeStatus(cfg.budget_amount, spent, cfg.currency);
@@ -65,44 +68,64 @@ export async function recordAndEvaluate(
     await sendMessage(
       env,
       cfg.group_chat_id,
-      thresholdMessage(level, status, cfg.warn_pct, cfg.alert_pct, cfg.period as Period, start),
+      thresholdMessage(level, status, cfg.warn_pct, cfg.alert_pct, cfg.period as Period, start, cal),
     );
     await markAlertSent(env, startIso, level);
   }
 }
 
 // Human-readable current status — used by the on-demand `/status` command.
+// Shows the default envelope, then one line per category budget.
 export async function budgetStatusText(env: Env): Promise<string> {
   const cfg = await getConfig(env);
+  const cal = calendarFrom(env);
   if (cfg.budget_amount <= 0) {
     return "No budget set yet. Send <code>/budget 500</code> to set one.";
   }
-  const start = periodStart(cfg.period as Period);
+  const start = periodStart(cfg.period as Period, new Date(), cal);
+  // Uncategorized spend only — categorized charges belong to their own envelope.
   const spent = await sumSince(env, start.toISOString());
   const status = computeStatus(cfg.budget_amount, spent, cfg.currency);
-  const label = periodLabel(cfg.period as Period, start);
+  const label = periodLabel(cfg.period as Period, start, cal);
   const bar = progressBar(status.pct);
-  return (
+
+  let out =
     `<b>Budget — ${label}</b>\n` +
     `${bar} ${status.pct.toFixed(0)}%\n` +
     `Spent: ${formatMoney(status.spent, status.currency)} of ${formatMoney(status.budget, status.currency)}\n` +
-    `Remaining: <b>${formatMoney(status.remaining, status.currency)}</b>`
-  );
+    `Remaining: <b>${formatMoney(status.remaining, status.currency)}</b>`;
+
+  const cats = await listCategories(env);
+  if (cats.length) {
+    const lines: string[] = [];
+    for (const c of cats) {
+      const p: Period = isPeriod(c.period) ? c.period : "yearly";
+      const cSpent = await sumSince(env, periodStart(p, new Date(), cal).toISOString(), c.id);
+      const remaining = c.amount - cSpent;
+      lines.push(
+        `• ${c.label}: ${formatMoney(cSpent, cfg.currency)} of ` +
+          `${formatMoney(c.amount, cfg.currency)} — ${formatMoney(remaining, cfg.currency)} left`,
+      );
+    }
+    out += `\n\n<b>Other envelopes</b>\n${lines.join("\n")}`;
+  }
+  return out;
 }
 
 // Weekly digest: last 7 days of spend + progress toward the budget period.
 export async function weeklySummaryText(env: Env): Promise<string | null> {
   const cfg = await getConfig(env);
+  const cal = calendarFrom(env);
   if (!cfg.group_chat_id || cfg.budget_amount <= 0) return null;
 
-  const weekStart = daysAgo(7);
+  const weekStart = daysAgo(7, new Date(), cal);
   const weekTxns = await listSince(env, weekStart.toISOString());
   const weekSpent = weekTxns.reduce((sum, t) => sum + t.amount, 0);
 
-  const start = periodStart(cfg.period as Period);
+  const start = periodStart(cfg.period as Period, new Date(), cal);
   const periodSpent = await sumSince(env, start.toISOString());
   const status = computeStatus(cfg.budget_amount, periodSpent, cfg.currency);
-  const label = periodLabel(cfg.period as Period, start);
+  const label = periodLabel(cfg.period as Period, start, cal);
 
   const top = [...weekTxns]
     .sort((a, b) => b.amount - a.amount)
@@ -132,8 +155,9 @@ function thresholdMessage(
   alertPct: number,
   period: Period,
   start: Date,
+  cal: Calendar,
 ): string {
-  const label = periodLabel(period, start);
+  const label = periodLabel(period, start, cal);
   if (level === "alert") {
     const over = status.remaining < 0;
     return (

@@ -19,8 +19,8 @@ export default {
     }
   },
 
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-    return handleFetch(request, env);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleFetch(request, env, ctx);
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {

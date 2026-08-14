@@ -7,3 +7,8 @@ TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
 # A random string you choose. Telegram will send it in a header on every
 # webhook call so the Worker can reject forged requests.
 TELEGRAM_WEBHOOK_SECRET=choose-a-long-random-string
+
+# Anthropic API key, for the natural-language (@mention) path. Optional —
+# without it slash commands work exactly as before and @mentions reply asking
+# you to use them. Get one at console.anthropic.com.
+ANTHROPIC_API_KEY=sk-ant-your-key-here
