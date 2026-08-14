@@ -112,9 +112,49 @@ const chaseRule: Rule = {
   },
 };
 
+// Wells Fargo puts the amount in a sentence and the merchant on a labelled
+// line of the BODY:
+//   "You made a purchase of $24.31"
+//   "Merchant: TRADER JOES #123"
+//   "Date: 08/14/2026"
+// Body text is collapsed to a single line before rules run, so the merchant is
+// read up to the next "Label:" (normally "Date:") rather than to end of line.
+// Like the Chase rule, NON_SPEND is only checked against the subject: the
+// "You made a purchase of" phrasing is spend-specific, and Wells Fargo footers
+// ("You received this message because...") would otherwise veto a real alert.
+const wellsFargoRule: Rule = {
+  name: "wells-fargo",
+  extract(subject, combined) {
+    if (NON_SPEND.test(subject)) return null;
+    const m = combined.match(
+      /you made a purchase of\s+(USD|GBP|EUR|\$|£|€)?\s?([0-9](?:[0-9,]*)(?:\.[0-9]{1,2})?)/i,
+    );
+    if (!m) return null;
+    const amount = toNumber(m[2]);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    return {
+      amount,
+      merchant: findLabelledMerchant(combined),
+      currency: m[1] ? normalizeCurrency(m[1]) : "USD",
+    };
+  },
+};
+
+// "Merchant: <name>" / "Merchant Name: <name>". The value stops at the next
+// "Label:" field, at sentence punctuation, or at the end of the text, and is
+// length-capped so a missing terminator can't swallow the email footer.
+function findLabelledMerchant(text: string): string | null {
+  const m = text.match(
+    /\bmerchant(?:\s+name)?\s*:\s*([^:]{1,60}?)(?=\s+[A-Za-z][A-Za-z ]{0,24}:|[,;!]|\.\s|\.?$)/i,
+  );
+  if (!m) return null;
+  const merchant = m[1].trim().replace(/\s+/g, " ").replace(/\.+$/, "");
+  return merchant.length ? merchant : null;
+}
+
 // Bank-specific rules run first; add entries here for banks whose wording the
 // generic rule mis-parses. Each returns a ParsedTxn or null.
-const BANK_RULES: Rule[] = [chaseRule];
+const BANK_RULES: Rule[] = [chaseRule, wellsFargoRule];
 
 const collapse = (s: string): string => (s ?? "").replace(/\s+/g, " ").trim();
 

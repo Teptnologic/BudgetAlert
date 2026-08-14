@@ -85,6 +85,45 @@ describe("parseTransaction", () => {
     expect(r?.merchant).toBeNull();
   });
 
+  it("parses a Wells Fargo alert with labelled merchant and date", () => {
+    // Real Wells Fargo shape: amount in a sentence, merchant on its own line,
+    // followed by a Date line and unsubscribe boilerplate.
+    const subject = "Wells Fargo Purchase Alert";
+    const body = [
+      "You made a purchase of $24.31",
+      "Merchant: TRADER JOES #123",
+      "Date: 08/14/2026 09:14 AM PT",
+      "You received this message because you set up alerts. Manage them in Wells Fargo Online.",
+    ].join("\n");
+    const r = parseTransaction(subject, body);
+    expect(r?.amount).toBe(24.31);
+    expect(r?.merchant).toBe("TRADER JOES #123");
+    expect(r?.currency).toBe("USD");
+  });
+
+  it("keeps dots in a Wells Fargo merchant name", () => {
+    const r = parseTransaction(
+      "Wells Fargo Purchase Alert",
+      "You made a purchase of $1,299.00\nMerchant: AMAZON.COM\nDate: Aug 14, 2026",
+    );
+    expect(r?.amount).toBe(1299);
+    expect(r?.merchant).toBe("AMAZON.COM");
+  });
+
+  it("parses a Wells Fargo alert with no merchant line", () => {
+    const r = parseTransaction("Wells Fargo Purchase Alert", "You made a purchase of $8.00.");
+    expect(r?.amount).toBe(8);
+    expect(r?.merchant).toBeNull();
+  });
+
+  it("ignores a Wells Fargo reversal alert", () => {
+    const r = parseTransaction(
+      "Wells Fargo purchase reversed",
+      "You made a purchase of $24.31\nMerchant: TRADER JOES #123",
+    );
+    expect(r).toBeNull();
+  });
+
   it("copes with missing merchant", () => {
     const r = parseTransaction("You spent $5.00");
     expect(r?.amount).toBe(5);
