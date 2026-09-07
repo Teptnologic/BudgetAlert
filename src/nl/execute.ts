@@ -5,8 +5,9 @@
 import type { Env } from "../env";
 import { calendarFrom } from "../env";
 import type { Intent, Window } from "./schema";
-import { isMutating, batchMutates, normalizeIntent } from "./schema";
-import { planBatch, applyBatch, type StepOutcome } from "./plan";
+import { isMutating, batchMutates, normalizeIntent, normalizeBatch } from "./schema";
+import { planBatch, applyBatch, chargeLine, type PlannedStep, type StepOutcome } from "./plan";
+import { MAX_CANDIDATES } from "./resolve";
 import {
   isPeriod,
   periodStart,
@@ -15,6 +16,7 @@ import {
   periodLabel,
   daysAgo,
   type Period,
+  type Calendar,
 } from "../core/period";
 import { formatMoney, computeStatus } from "../core/engine";
 import { budgetStatusText, progressBar } from "../service";
@@ -34,8 +36,64 @@ import {
 
 export interface Reply {
   text: string;
-  // When set, render Yes/No buttons carrying this token as callback_data.
-  confirmToken?: string;
+  /**
+   * Set when the reply is waiting on a tap. The batch travels in `payload` for
+   * the caller to stash; minting the token that identifies it is the
+   * transport's job, since only the transport knows what fits in a button.
+   */
+  stage?: Stage;
+}
+
+export interface Stage {
+  /** JSON to store against the token — read back by parsePending(). */
+  payload: string;
+  /**
+   * One button per label, answered by INDEX into this list. Absent for an
+   * ordinary yes/no confirmation.
+   */
+  choices?: string[];
+}
+
+/**
+ * A batch parked in pending_actions.
+ *
+ * `confirm` is staged and waiting on yes/no. `disambiguate` is waiting on which
+ * of `candidates` (transaction ids) step `step` meant; answering pins the
+ * chosen row onto that step and re-plans, which is what turns the answer into a
+ * confirmation. The whole batch travels along either way, so a message with
+ * several steps survives a question about one of them.
+ */
+export interface PendingBatch {
+  kind: "confirm" | "disambiguate";
+  actions: Intent[];
+  step: number;
+  candidates: number[];
+}
+
+// Never throws: a malformed or truncated row degrades to an empty confirm,
+// which the caller reports as expired rather than acting on.
+//
+// Also accepts the bare `{actions: […]}` (and legacy single-intent) shapes,
+// which is what rows staged before this existed look like.
+export function parsePending(json: string): PendingBatch {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    // normalizeBatch never yields an empty list, so callers always have
+    // something to report rather than an empty message.
+    return { kind: "confirm", actions: normalizeBatch(null), step: 0, candidates: [] };
+  }
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const candidates = Array.isArray(o.candidates)
+    ? o.candidates.map((n) => Math.trunc(Number(n))).filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  return {
+    kind: o.kind === "disambiguate" ? "disambiguate" : "confirm",
+    actions: normalizeBatch(raw),
+    step: Math.max(0, Math.trunc(Number(o.step) || 0)),
+    candidates,
+  };
 }
 
 function esc(s: string): string {
@@ -49,13 +107,6 @@ function windowPeriod(window: Intent["window"]): Period {
   if (window === "quarter") return "quarterly";
   if (window === "month") return "monthly";
   return "weekly";
-}
-
-
-function token(): string {
-  // Short + opaque: Telegram caps callback_data at 64 bytes, so the batch is
-  // stored server-side and only this key travels in the button.
-  return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 }
 
 /* ------------------------------------------------------------------- reads */
@@ -310,44 +361,106 @@ function numbered(items: string[]): string {
   return items.map((t, i) => `${i + 1}. ${t}`).join("\n");
 }
 
-// Plan a batch and either answer it (reads only) or stage it for confirmation.
+// Plan a batch and either answer it (reads only), ask which charge it meant, or
+// stage it for confirmation.
 export async function executeBatch(env: Env, intents: Intent[]): Promise<Reply> {
   if (!batchMutates(intents)) {
     return { text: await readReplies(env, intents) };
   }
 
   const steps = await planBatch(env, intents);
-  const bad = steps.filter((s) => !s.ok);
+
+  // Carry every row the plan resolved into the copy that gets staged, so
+  // approving acts on the charge the confirmation named. planBatch returns one
+  // step per intent, in order, so the indexes line up.
+  const staged = intents.map((intent, i) => {
+    const id = steps[i]?.txnId ?? 0;
+    return id ? { ...intent, txnId: id } : intent;
+  });
+
+  // "Which one did you mean?" is a question, not a refusal — but only worth
+  // asking if the rest of the batch is sound, since a hard failure blocks it
+  // regardless of how the question is answered.
+  const hard = steps.filter((s) => !s.ok && !s.candidates?.length);
+  const asking = hard.length ? -1 : steps.findIndex((s) => (s.candidates?.length ?? 0) > 0);
+  if (asking >= 0) {
+    const cfg = await getConfig(env);
+    return askWhich(steps, staged, asking, cfg.currency, calendarFrom(env));
+  }
 
   // Validate upfront: one broken step blocks the whole batch, so a partially
   // understood message never half-applies.
   // Show the parse on failure too. A rejected step is exactly when the user
   // needs to see how the message was read — "no amount given" is baffling when
   // they plainly gave one, and the fields say where it actually landed.
-  if (bad.length) {
+  if (hard.length) {
     const header =
       steps.length === 1
         ? "I couldn't do that:"
         : "I couldn't do all of that, so I haven't done any of it:";
-    const blocks = steps.map((s, i) => {
-      const heading = steps.length === 1 ? s.view.title : `${i + 1}. ${s.view.title}`;
-      return [
-        `<b>${esc(heading)}</b> — ${s.text}`,
-        ...fieldLines(s.view.fields),
-      ].join("\n");
-    });
-    return { text: `${header}\n\n${blocks.join("\n\n")}` };
+    return { text: `${header}\n\n${describeSteps(steps, true)}` };
   }
-
-  const blocks = steps.map((s, i) => {
-    const heading = steps.length === 1 ? s.view.title : `${i + 1}. ${s.view.title}`;
-    return [`<b>${esc(heading)}</b>`, ...fieldLines(s.view.fields)].join("\n");
-  });
 
   const header =
     steps.length === 1 ? "Confirm this?" : `Confirm these ${steps.length} changes?`;
 
-  return { text: `${header}\n\n${blocks.join("\n\n")}`, confirmToken: token() };
+  return {
+    text: `${header}\n\n${describeSteps(steps, false)}`,
+    stage: { payload: JSON.stringify({ kind: "confirm", actions: staged }) },
+  };
+}
+
+// Every step, spelled out. `withOutcome` appends each step's verdict to its
+// heading, which is what a rejection needs and a confirmation doesn't.
+function describeSteps(steps: PlannedStep[], withOutcome: boolean): string {
+  return steps
+    .map((s, i) => {
+      const heading = steps.length === 1 ? s.view.title : `${i + 1}. ${s.view.title}`;
+      const title = withOutcome ? `<b>${esc(heading)}</b> — ${s.text}` : `<b>${esc(heading)}</b>`;
+      return [title, ...fieldLines(s.view.fields)].join("\n");
+    })
+    .join("\n\n");
+}
+
+// Ask which charge one step meant, offering the rows it could not choose
+// between. The whole batch is staged with the question, so answering resumes
+// the original message rather than making the user retype it.
+//
+// One question at a time: answering re-plans from scratch, and if another step
+// is still ambiguous the next question follows.
+function askWhich(
+  steps: PlannedStep[],
+  staged: Intent[],
+  index: number,
+  currency: string,
+  cal: Calendar,
+): Reply {
+  const step = steps[index];
+  const candidates = (step.candidates ?? []).slice(0, MAX_CANDIDATES);
+  const money = (n: number) => formatMoney(n, currency);
+  const heading =
+    steps.length === 1
+      ? "Which charge did you mean?"
+      : `Which charge did you mean? (step ${index + 1} of ${steps.length})`;
+
+  return {
+    text: `${heading}\n\n${describeSteps(steps, true)}`,
+    stage: {
+      payload: JSON.stringify({
+        kind: "disambiguate",
+        step: index,
+        candidates: candidates.map((t) => t.id),
+        actions: staged,
+      }),
+      // Telegram renders button text verbatim — plain, and short enough to read
+      // on a phone.
+      choices: candidates.map((t) => truncate(chargeLine(t, money, cal), 48)),
+    },
+  };
+}
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
 }
 
 // The parse, spelled out. A one-line summary can read plausibly while a single

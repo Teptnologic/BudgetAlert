@@ -49,6 +49,7 @@ different chat platform later means swapping an adapter, not a rewrite.
 | `src/nl/interpret.ts` | Claude API call — classification only, never touches D1 |
 | `src/nl/execute.ts` | Reads (status, history, reports) + staging writes for confirmation |
 | `src/nl/plan.ts` | Dry-run validation of a batch, then applying the approved plan |
+| `src/nl/resolve.ts` | Which transaction each selector in a batch means |
 | `src/router.ts` | HTTP routes: `/telegram`, `/inbound`, health |
 | `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` (digest + period reports) |
 
@@ -105,9 +106,10 @@ live, so every status recomputes on the next read.
 
 Removing one (`delete the last charge`, `remove the $12 coffee`) is for a record
 that shouldn't exist at all — a charge that was never yours, or the same spend
-captured twice. Nothing restores the row afterwards, so the confirmation names
-the row the selector actually landed on rather than just repeating the selector
-back:
+captured twice. Nothing restores the row afterwards. Every action that touches an
+existing charge names the row it actually landed on rather than repeating the
+selector back — "Most recent charge" and "The $0.01 charge" don't say *which*
+charge, and approving one of those is a blind approval:
 
 ```
 Confirm this?
@@ -123,7 +125,40 @@ same alert it will be captured again. "Remove" means the record was wrong, not
 "never accept this alert".
 
 Anything that changes data shows a summary with **Yes / No** buttons and only
-applies on tap, so a misread amount can't silently move money.
+applies on tap, so a misread amount can't silently move money. The charge named
+in that summary is **pinned**: approving acts on that exact row, not on whatever
+the selector matches a second time.
+
+### When a selector matches more than one charge
+
+Selectors are your own words, and they routinely fit several rows — one merchant
+name can be a prefix of another (`FD *CA DMV 640` and `FD *CA DMV 640 *SVC`), and
+every $0.01 pre-authorization hold looks like every other one. Rather than taking
+the newest match and hoping, the bot asks:
+
+```
+Which charge did you mean?
+
+Correct amount — ⚠️ 2 transactions matching "DMV" — which one?
+Which charge  Matching "DMV"
+New amount    $616.00
+Option 1      $0.01 — FD *CA DMV 640 *SVC (09-06)
+Option 2      $0.01 — FD *CA DMV 640 (09-06)
+                  [1. $0.01 — FD *CA DMV 640 *SVC (09-06)]
+                  [2. $0.01 — FD *CA DMV 640 (09-06)]
+                  [✖️ None of these]
+```
+
+Answering pins that row and re-plans the message, which turns the question into
+the ordinary confirmation — the rest of the batch is carried along, so you never
+retype it. Past a handful of matches it asks you to narrow the selector instead
+of listing them all.
+
+Selectors are resolved for the message **as a whole**, not left to right, so a
+step whose selector names exactly one charge claims it before a vaguer step can:
+*"change FD \*CA DMV 640 to $616, change FD \*CA DMV 640 \*SVC to $12.94"* gives
+each step its own charge, and an exact merchant match outranks the longer names
+it appears inside.
 
 **How it's kept safe:** the model only classifies a message into a structured
 intent (`{action, category, amount, …}`). It never writes SQL and never sees the

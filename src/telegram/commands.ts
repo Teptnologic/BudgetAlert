@@ -26,11 +26,18 @@ import {
   sumSince,
 } from "../store/d1";
 import { budgetStatusText } from "../service";
-import { sendMessage, answerCallback, editMessage } from "../notify/telegram";
+import {
+  sendMessage,
+  answerCallback,
+  editMessage,
+  confirmKeyboard,
+  chooseKeyboard,
+  type Keyboard,
+} from "../notify/telegram";
 import { formatMoney } from "../core/engine";
 import { isPeriod, periodStart } from "../core/period";
 import { interpret } from "../nl/interpret";
-import { executeBatch, applyApproved } from "../nl/execute";
+import { executeBatch, applyApproved, parsePending, type Reply } from "../nl/execute";
 import { normalizeBatch } from "../nl/schema";
 
 interface TgUpdate {
@@ -85,6 +92,23 @@ function stripMention(text: string, botUsername?: string): string | null {
 
 /* -------------------------------------------------------- natural language */
 
+// Short + opaque: Telegram caps callback_data at 64 bytes, so a staged batch
+// lives in pending_actions and only this key travels in the button.
+function token(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+}
+
+// Park a reply that is waiting on a tap and build the buttons that answer it.
+// Returns undefined for a reply that asks nothing.
+async function stage(env: Env, chat: string, reply: Reply): Promise<Keyboard | undefined> {
+  if (!reply.stage) return undefined;
+  const tok = token();
+  await savePending(env, tok, chat, reply.stage.payload, reply.text);
+  return reply.stage.choices?.length
+    ? chooseKeyboard(tok, reply.stage.choices)
+    : confirmKeyboard(tok);
+}
+
 async function handleNaturalLanguage(env: Env, chat: string, text: string): Promise<void> {
   if (!text) {
     await sendMessage(env, chat, 'Yes? Ask me something like "how much is left this week?"');
@@ -113,11 +137,7 @@ async function handleNaturalLanguage(env: Env, chat: string, text: string): Prom
   });
 
   const reply = await executeBatch(env, intents);
-
-  if (reply.confirmToken) {
-    await savePending(env, reply.confirmToken, chat, JSON.stringify(intents), reply.text);
-  }
-  await sendMessage(env, chat, reply.text, reply.confirmToken);
+  await sendMessage(env, chat, reply.text, await stage(env, chat, reply));
 }
 
 async function handleCallback(update: TgUpdate, env: Env): Promise<void> {
@@ -130,7 +150,7 @@ async function handleCallback(update: TgUpdate, env: Env): Promise<void> {
     return;
   }
   const chat = String(chatId);
-  const [verdict, tok] = data.split(":");
+  const [verdict, tok, arg] = data.split(":");
 
   if (verdict === "n") {
     await takePending(env, tok ?? "");
@@ -139,14 +159,51 @@ async function handleCallback(update: TgUpdate, env: Env): Promise<void> {
     return;
   }
 
-  if (verdict !== "y" || !tok) {
+  if ((verdict !== "y" && verdict !== "d") || !tok) {
     await answerCallback(env, cb.id);
     return;
   }
 
   // takePending deletes as it reads, so a double-tap finds nothing.
   const pending = await takePending(env, tok);
-  if (!pending) {
+  // The token is unguessable, but a batch still belongs to the chat it was
+  // staged in and must not be applied from another one.
+  if (!pending || pending.chat_id !== chat) {
+    await answerCallback(env, cb.id, "That request expired");
+    await editMessage(env, chat, messageId, "⏰ That request expired — ask me again.");
+    return;
+  }
+
+  const batch = parsePending(pending.intent);
+
+  if (verdict === "d") {
+    // Answering "which charge?" pins the chosen row onto the step that asked
+    // and re-plans the whole batch. That either produces the next question or
+    // the confirmation — nothing is written until a Yes.
+    const choice = Number(arg);
+    const txnId = batch.candidates[choice];
+    if (batch.kind !== "disambiguate" || !Number.isInteger(choice) || !txnId) {
+      await answerCallback(env, cb.id, "That request expired");
+      await editMessage(env, chat, messageId, "⏰ That request expired — ask me again.");
+      return;
+    }
+    await answerCallback(env, cb.id, "Got it…");
+    try {
+      const intents = batch.actions.map((intent, i) =>
+        i === batch.step ? { ...intent, txnId } : intent,
+      );
+      const reply = await executeBatch(env, intents);
+      await editMessage(env, chat, messageId, reply.text, await stage(env, chat, reply));
+    } catch (err) {
+      console.error("callback disambiguate error:", err);
+      await editMessage(env, chat, messageId, "⚠️ That didn't go through. Try again.");
+    }
+    return;
+  }
+
+  // A Yes on an unanswered "which charge?" must never apply anything: no button
+  // offers it, so reaching here means the question is stale.
+  if (batch.kind !== "confirm") {
     await answerCallback(env, cb.id, "That request expired");
     await editMessage(env, chat, messageId, "⏰ That request expired — ask me again.");
     return;
@@ -154,8 +211,7 @@ async function handleCallback(update: TgUpdate, env: Env): Promise<void> {
 
   await answerCallback(env, cb.id, "Working…");
   try {
-    const intents = normalizeBatch(JSON.parse(pending.intent));
-    const result = await applyApproved(env, intents);
+    const result = await applyApproved(env, batch.actions);
     await editMessage(env, chat, messageId, result);
   } catch (err) {
     console.error("callback apply error:", err);
