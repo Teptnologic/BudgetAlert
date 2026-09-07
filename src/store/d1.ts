@@ -115,6 +115,10 @@ export async function listSince(
 
 export type TxnScope = { kind: "main" } | { kind: "category"; id: number } | { kind: "all" };
 
+// Hard ceiling on rows returned to a chat message. Telegram caps a message at
+// 4096 characters, so a listing past this is unreadable however it is asked for.
+export const MAX_ROWS = 50;
+
 // Transactions inside a half-open range [since, until), oldest first so a
 // history reads as a chronology.
 //
@@ -314,6 +318,52 @@ export async function recentTransactions(env: Env, limit = 10): Promise<FullTxnR
     .bind(Math.max(1, Math.min(50, limit)))
     .all<FullTxnRow>();
   return res.results ?? [];
+}
+
+// The most recent transactions WITHIN a scope, newest first.
+//
+// Filtering has to happen in SQL, not after the fact: fetching the newest N
+// overall and filtering down to one envelope reports "nothing recorded" for an
+// envelope whose charges simply aren't among the account's newest N. An
+// envelope with years of history and no spend this month is exactly that case.
+export async function listRecent(
+  env: Env,
+  scope: TxnScope,
+  limit: number,
+): Promise<FullTxnRow[]> {
+  const cols = `SELECT id, amount, merchant, occurred_at, category_id FROM transactions`;
+  const order = `ORDER BY occurred_at DESC, id DESC LIMIT ?`;
+  const n = Math.max(1, Math.min(MAX_ROWS, Math.trunc(limit)));
+
+  if (scope.kind === "category") {
+    const res = await env.DB.prepare(`${cols} WHERE category_id = ? ${order}`)
+      .bind(scope.id, n)
+      .all<FullTxnRow>();
+    return res.results ?? [];
+  }
+  const where = scope.kind === "main" ? ` WHERE category_id IS NULL` : "";
+  const res = await env.DB.prepare(`${cols}${where} ${order}`).bind(n).all<FullTxnRow>();
+  return res.results ?? [];
+}
+
+// Count and total for a scope over ALL time, with no date bound.
+//
+// Separate from the row listing because an all-time answer still has to fit in
+// one chat message: the rows get capped, the total must not be capped with them
+// or "all my gift spending" would report a total that silently omits the oldest
+// charges.
+export async function sumScope(env: Env, scope: TxnScope): Promise<{ n: number; total: number }> {
+  const cols = `SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM transactions`;
+
+  if (scope.kind === "category") {
+    const row = await env.DB.prepare(`${cols} WHERE category_id = ?`)
+      .bind(scope.id)
+      .first<{ n: number; total: number }>();
+    return { n: row?.n ?? 0, total: row?.total ?? 0 };
+  }
+  const where = scope.kind === "main" ? ` WHERE category_id IS NULL` : "";
+  const row = await env.DB.prepare(`${cols}${where}`).first<{ n: number; total: number }>();
+  return { n: row?.n ?? 0, total: row?.total ?? 0 };
 }
 
 // One transaction by id. Used to re-read a row that was pinned at planning
