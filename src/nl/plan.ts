@@ -14,6 +14,7 @@ import type { Env } from "../env";
 import { calendarFrom } from "../env";
 import type { Intent } from "./schema";
 import { isMutating } from "./schema";
+import { resolveBatch, MAX_CANDIDATES, type Resolution } from "./resolve";
 import { isPeriod, daysAgo, type Period, type Calendar } from "../core/period";
 import { formatMoney } from "../core/engine";
 import {
@@ -21,6 +22,7 @@ import {
   listCategories,
   findCategory,
   findTransaction,
+  getTransaction,
   upsertCategory,
   addManualTransaction,
   setCategoryBudget,
@@ -31,6 +33,7 @@ import {
   categoryTotals,
   setBudget,
   setPeriod,
+  type FullTxnRow,
 } from "../store/d1";
 
 export interface PlannedStep {
@@ -39,6 +42,17 @@ export interface PlannedStep {
   text: string;
   /** The parsed intent, shown so a misparse is visible before approval. */
   view: IntentView;
+  /**
+   * The transaction this step resolved to. Carried into the staged intent so
+   * applying acts on the row the confirmation showed, rather than running the
+   * selector a second time and possibly landing somewhere else.
+   */
+  txnId?: number;
+  /**
+   * Set when the selector matched several rows and the step is blocked on
+   * "which one?". The caller turns these into the choices it offers.
+   */
+  candidates?: FullTxnRow[];
 }
 
 // What planStep returns before the view is attached. `resolved` carries fields
@@ -49,6 +63,10 @@ interface StepPlan {
   text: string;
   /** Raw text, not HTML: fieldLines() in execute.ts escapes these. */
   resolved?: [label: string, value: string][];
+  /** The row this step landed on, pinned for the apply pass. */
+  txnId?: number;
+  /** The rows it could not choose between. */
+  candidates?: FullTxnRow[];
 }
 
 // How the intent is shown back to the user before they approve it. This is the
@@ -168,7 +186,6 @@ interface ProjectedCategory {
 
 interface Projection {
   categories: Map<string, ProjectedCategory>;
-  claimedTxnIds: number[];
   budgetAmount: number;
   period: Period;
   currency: string;
@@ -179,16 +196,68 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// "No transaction matching …" — shared by the three actions that resolve a
-// single existing transaction from a selector, so the wording can't drift apart.
+// How a selector reads in a message about it — shared by the four actions that
+// resolve a single existing transaction, so the wording can't drift apart.
+function selectorPhrase(intent: Intent, money: (n: number) => string, fallback: string): string {
+  return intent.selectorKind === "amount"
+    ? `matching ${money(intent.amount)}`
+    : intent.selectorKind === "merchant"
+      ? `matching “${esc(intent.selectorValue)}”`
+      : fallback;
+}
+
 function noMatchText(intent: Intent, money: (n: number) => string, fallback: string): string {
-  const what =
-    intent.selectorKind === "amount"
-      ? `matching ${money(intent.amount)}`
-      : intent.selectorKind === "merchant"
-        ? `matching “${esc(intent.selectorValue)}”`
-        : fallback;
-  return `⚠️ No transaction ${what}.`;
+  return `⚠️ No transaction ${selectorPhrase(intent, money, fallback)}.`;
+}
+
+// One transaction, named the way a person would recognize it. A selector alone
+// ("Most recent charge", "The $0.01 charge") doesn't say WHICH row it landed
+// on, so every confirmation that touches an existing charge spells this out.
+export function chargeLine(txn: FullTxnRow, money: (n: number) => string, cal: Calendar): string {
+  const day = localDay(txn.occurred_at, cal);
+  return `${money(txn.amount)} — ${txn.merchant ?? "unknown"}${day ? ` (${day})` : ""}`;
+}
+
+// Either the row this step acts on, or the StepPlan explaining why there isn't
+// one. Resolution happens batch-wide in resolveBatch(); this turns its verdict
+// into something the user reads.
+type Picked = { txn: FullTxnRow } | { blocked: StepPlan };
+
+function pickTxn(
+  intent: Intent,
+  res: Resolution | undefined,
+  money: (n: number) => string,
+  cal: Calendar,
+  fallback: string,
+): Picked {
+  if (!res || res.kind === "none") {
+    return { blocked: { ok: false, text: noMatchText(intent, money, fallback) } };
+  }
+  if (res.kind === "one") return { txn: res.txn };
+
+  const phrase = selectorPhrase(intent, money, fallback);
+  if (res.kind === "too-many") {
+    return {
+      blocked: {
+        ok: false,
+        text:
+          `⚠️ ${res.count}${res.capped ? "+" : ""} transactions ${phrase} — ` +
+          `too many to choose from. Name the merchant or the amount more exactly.`,
+      },
+    };
+  }
+  // Ambiguous: blocked, but answerable. The candidates ride along so the caller
+  // can ask instead of picking one and hoping.
+  return {
+    blocked: {
+      ok: false,
+      text: `⚠️ ${res.candidates.length} transactions ${phrase} — which one?`,
+      candidates: res.candidates,
+      resolved: res.candidates
+        .slice(0, MAX_CANDIDATES)
+        .map((t, i) => [`Option ${i + 1}`, chargeLine(t, money, cal)] as [string, string]),
+    },
+  };
 }
 
 // An envelope's display name from its row id, for describing a charge that is
@@ -225,7 +294,6 @@ async function buildProjection(env: Env): Promise<Projection> {
   }
   return {
     categories,
-    claimedTxnIds: [],
     budgetAmount: cfg.budget_amount,
     period: isPeriod(cfg.period) ? cfg.period : "weekly",
     currency: cfg.currency,
@@ -236,7 +304,15 @@ async function buildProjection(env: Env): Promise<Projection> {
 /* ------------------------------------------------------------------- plan */
 
 // Validate one step against the projection and, if valid, advance it.
-async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPlan> {
+//
+// `res` is this step's share of the batch-wide transaction assignment, computed
+// up front by resolveBatch(). Steps that don't name a transaction ignore it.
+async function planStep(
+  env: Env,
+  intent: Intent,
+  p: Projection,
+  res?: Resolution,
+): Promise<StepPlan> {
   const money = (n: number) => formatMoney(n, p.currency);
 
   switch (intent.action) {
@@ -309,15 +385,14 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
             `create it first, or ask for both in one message.`,
         };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      // Exclude rows an earlier step already claimed, so "move the last two
-      // charges" doesn't resolve to the same transaction twice.
-      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) return { ok: false, text: noMatchText(intent, money, "to move") };
-      p.claimedTxnIds.push(txn.id);
+      const picked = pickTxn(intent, res, money, p.calendar, "to move");
+      if ("blocked" in picked) return picked.blocked;
+      const { txn } = picked;
       return {
         ok: true,
         text: `Move ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} → <b>${esc(cat.label)}</b>`,
+        txnId: txn.id,
+        resolved: [["Moving", chargeLine(txn, money, p.calendar)]],
       };
     }
 
@@ -328,15 +403,16 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
       if (intent.newAmount <= 0) {
         return { ok: false, text: "⚠️ No new amount given." };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) return { ok: false, text: noMatchText(intent, money, "to change") };
-      p.claimedTxnIds.push(txn.id);
+      const picked = pickTxn(intent, res, money, p.calendar, "to change");
+      if ("blocked" in picked) return picked.blocked;
+      const { txn } = picked;
       return {
         ok: true,
         text:
           `Change ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
           `to <b>${money(intent.newAmount)}</b>`,
+        txnId: txn.id,
+        resolved: [["Changing", chargeLine(txn, money, p.calendar)]],
       };
     }
 
@@ -344,21 +420,14 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
       if (intent.selectorKind === "none") {
         return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) return { ok: false, text: noMatchText(intent, money, "to remove") };
-      p.claimedTxnIds.push(txn.id);
-      const who = txn.merchant ?? "unknown";
-      const day = localDay(txn.occurred_at, p.calendar);
+      const picked = pickTxn(intent, res, money, p.calendar, "to remove");
+      if ("blocked" in picked) return picked.blocked;
+      const { txn } = picked;
       return {
         ok: true,
-        text: `Remove ${money(txn.amount)} — ${esc(who)}`,
-        // "Most recent charge" doesn't say WHICH charge that is, so a
-        // selector-only confirmation asks for a blind approval. Name the row
-        // the selector actually landed on instead. move_transaction and
-        // set_transaction_amount have the same blind spot and can use this
-        // too; removal goes first because it takes the whole row at once.
-        resolved: [["Removing", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`]],
+        text: `Remove ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")}`,
+        txnId: txn.id,
+        resolved: [["Removing", chargeLine(txn, money, p.calendar)]],
       };
     }
 
@@ -366,29 +435,26 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
       if (intent.selectorKind === "none") {
         return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) return { ok: false, text: noMatchText(intent, money, "to move") };
-      // Claimed either way, so "move the last two charges back" walks two rows
-      // rather than reporting on the same one twice.
-      p.claimedTxnIds.push(txn.id);
+      const picked = pickTxn(intent, res, money, p.calendar, "to move");
+      if ("blocked" in picked) return picked.blocked;
+      const { txn } = picked;
       if (txn.category_id === null) {
         return {
           ok: true,
           // Not an error: the charge is already where the user wants it, and
           // failing the step would block every other step in the batch.
           text: `Leave ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} on the main budget (already there)`,
+          txnId: txn.id,
           resolved: [["Already there", "This charge is on the main budget"]],
         };
       }
-      const who = txn.merchant ?? "unknown";
-      const day = localDay(txn.occurred_at, p.calendar);
       const from = labelForId(p, txn.category_id);
       return {
         ok: true,
-        text: `Return ${money(txn.amount)} — ${esc(who)} to the main budget`,
+        text: `Return ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} to the main budget`,
+        txnId: txn.id,
         resolved: [
-          ["Returning", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`],
+          ["Returning", chargeLine(txn, money, p.calendar)],
           ...(from ? ([["Out of", from]] as [string, string][]) : []),
         ],
       };
@@ -431,9 +497,13 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
 
 export async function planBatch(env: Env, intents: Intent[]): Promise<PlannedStep[]> {
   const projection = await buildProjection(env);
+  // Which transaction each selector step lands on is decided for the batch as a
+  // whole, before any step is described: a selector that is a prefix of another
+  // must not take the row the more specific one names.
+  const resolutions = await resolveBatch(env, intents);
   const steps: PlannedStep[] = [];
-  for (const intent of intents) {
-    const { resolved, ...step } = await planStep(env, intent, projection);
+  for (const [i, intent] of intents.entries()) {
+    const { resolved, ...step } = await planStep(env, intent, projection, resolutions.get(i));
     const view = describeIntent(intent, projection.currency);
     steps.push({
       ...step,
@@ -445,8 +515,29 @@ export async function planBatch(env: Env, intents: Intent[]): Promise<PlannedSte
 
 /* ------------------------------------------------------------------ apply */
 
-// Execute one approved mutating step. Re-resolves against live state rather
-// than trusting anything computed at planning time.
+// The transaction an approved step acts on.
+//
+// The pin from planning wins. The confirmation named a specific charge, so
+// applying acts on THAT row or on none — re-running the selector here is how an
+// approved "change FD *CA DMV 640" once landed on an unrelated $0.01 charge,
+// because the selector matched several rows and the second resolution picked a
+// different one than the confirmation had shown.
+//
+// The selector fallback exists for one case only: a batch staged before pinning
+// existed and confirmed after this deployed. Those carry no row id.
+async function txnForApply(
+  env: Env,
+  intent: Intent,
+  claimed: number[],
+): Promise<FullTxnRow | null> {
+  if (intent.txnId > 0) return await getTransaction(env, intent.txnId);
+  if (intent.selectorKind === "none") return null;
+  const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+  return await findTransaction(env, intent.selectorKind, value, claimed);
+}
+
+// Execute one approved mutating step. Everything EXCEPT which transaction it
+// touches is re-resolved against live state; the transaction itself is pinned.
 async function applyStep(
   env: Env,
   intent: Intent,
@@ -509,8 +600,7 @@ async function applyStep(
       }
       const cat = await findCategory(env, intent.category);
       if (!cat) return { ok: false, text: `<b>${esc(intent.category)}</b> no longer exists` };
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      const txn = await txnForApply(env, intent, claimed);
       if (!txn) return { ok: false, text: "That transaction is no longer there" };
       claimed.push(txn.id);
       await setTxnCategory(env, txn.id, cat.id);
@@ -524,8 +614,7 @@ async function applyStep(
       if (intent.selectorKind === "none" || intent.newAmount <= 0) {
         return { ok: false, text: "That change is no longer valid" };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      const txn = await txnForApply(env, intent, claimed);
       if (!txn) return { ok: false, text: "That transaction is no longer there" };
       claimed.push(txn.id);
       await setTxnAmount(env, txn.id, intent.newAmount);
@@ -541,8 +630,7 @@ async function applyStep(
       if (intent.selectorKind === "none") {
         return { ok: false, text: "That removal is no longer valid" };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      const txn = await txnForApply(env, intent, claimed);
       if (!txn) return { ok: false, text: "That transaction is no longer there" };
       claimed.push(txn.id);
       await deleteTransaction(env, txn.id);
@@ -556,8 +644,7 @@ async function applyStep(
       if (intent.selectorKind === "none") {
         return { ok: false, text: "That move is no longer valid" };
       }
-      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
-      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      const txn = await txnForApply(env, intent, claimed);
       if (!txn) return { ok: false, text: "That transaction is no longer there" };
       claimed.push(txn.id);
       if (txn.category_id === null) {

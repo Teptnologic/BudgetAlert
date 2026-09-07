@@ -10,7 +10,7 @@ import {
   unknownIntent,
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
-import { executeBatch, applyApproved, scheduledReportText } from "../src/nl/execute";
+import { executeBatch, applyApproved, parsePending, scheduledReportText } from "../src/nl/execute";
 import { periodStart, periodStartAt, periodEnd, periodLabel, daysAgo, isPeriod, type Calendar } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
@@ -340,6 +340,22 @@ function fakeEnv(opts: {
     ...(opts.config ?? {}), // caller overrides win
   };
 
+  // Rows a selector query matches, newest first — `txns` is already in that
+  // order. Mirrors the WHERE clauses in findTransaction/findTransactions.
+  const matching = (sql: string, binds: any[]) => {
+    const m = sql.match(/id NOT IN \(([^)]*)\)/);
+    const excluded = m ? m[1].split(",").map(Number) : [];
+    let pool = txns.filter((t) => !excluded.includes(t.id));
+    if (sql.includes("ABS(amount")) {
+      pool = pool.filter((t) => Math.abs(t.amount - Number(binds[0])) < 0.005);
+    }
+    if (sql.includes("merchant LIKE")) {
+      const needle = String(binds[0]).replace(/%/g, "").toLowerCase();
+      pool = pool.filter((t) => (t.merchant ?? "").toLowerCase().includes(needle));
+    }
+    return pool;
+  };
+
   const writes: { sql: string; binds: any[] }[] = [];
   const DB: any = {
     // D1 runs a batch as one transaction; the stub records the same statements
@@ -365,22 +381,21 @@ function fakeEnv(opts: {
             return cats.find((c) => c.name === binds[0]) ?? null;
           }
           if (sql.includes("FROM transactions")) {
-            const m = sql.match(/id NOT IN \(([^)]*)\)/);
-            const excluded = m ? m[1].split(",").map(Number) : [];
-            let pool = txns.filter((t) => !excluded.includes(t.id));
-            if (sql.includes("ABS(amount")) {
-              pool = pool.filter((t) => Math.abs(t.amount - Number(binds[0])) < 0.005);
+            if (sql.includes("WHERE id = ?")) {
+              return txns.find((t) => t.id === Number(binds[0])) ?? null;
             }
-            if (sql.includes("merchant LIKE")) {
-              const needle = String(binds[0]).replace(/%/g, "").toLowerCase();
-              pool = pool.filter((t) => (t.merchant ?? "").toLowerCase().includes(needle));
-            }
-            return pool[0] ?? null;
+            return matching(sql, binds)[0] ?? null;
           }
           return null;
         },
         async all() {
           if (sql.includes("FROM categories")) return { results: cats };
+          // findTransactions(): every match, newest first, bounded by LIMIT.
+          // Matched narrowly so the GROUP BY aggregates below still reach theirs.
+          if (sql.includes("ORDER BY occurred_at DESC, id DESC LIMIT ?")) {
+            const limit = Number(binds[binds.length - 1]);
+            return { results: matching(sql, binds).slice(0, limit) };
+          }
           if (sql.includes("GROUP BY category_id")) {
             const byCat = new Map<number | null, { category_id: number | null; n: number; total: number }>();
             for (const t of txns) {
@@ -771,7 +786,7 @@ describe("remove_transaction", () => {
       fakeEnv({ transactions: txns }),
       normalizeBatch({ actions: [{ action: "remove_transaction", selector_kind: "last" }] }),
     );
-    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.stage).toBeTruthy();
     expect(reply.text).toContain("Confirm this?");
     expect(reply.text).toContain("<b>Remove transaction</b>");
     expect(reply.text).toContain("TOP GOLF BAY RESERVA (07-22)");
@@ -857,7 +872,7 @@ describe("report", () => {
 
   it("is a read — answered outright, never staged for a tap", async () => {
     const reply = await run({ window: "quarter" });
-    expect(reply.confirmToken).toBeUndefined();
+    expect(reply.stage).toBeUndefined();
   });
 
   it("separates main-budget spend from envelope spend", async () => {
@@ -1054,7 +1069,7 @@ describe("delete_category", () => {
       fakeEnv({ categories: cats, transactions: filed }),
       normalizeBatch({ actions: [{ action: "delete_category", category: "gift" }] }),
     );
-    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.stage).toBeTruthy();
     expect(reply.text).toContain("<b>Delete budget envelope</b>");
     expect(reply.text).toContain("return to the main budget");
   });
@@ -1190,7 +1205,7 @@ describe("executeBatch", () => {
       env(),
       normalizeBatch({ actions: [{ action: "move_transaction", category: "gift", selector_kind: "last" }] }),
     );
-    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.stage).toBeTruthy();
     expect(reply.text).toContain("<b>Move transaction</b>");
     expect(reply.text).toContain("Most recent charge");
   });
@@ -1207,7 +1222,7 @@ describe("executeBatch", () => {
         ],
       }),
     );
-    expect(reply.confirmToken).toBeUndefined();
+    expect(reply.stage).toBeUndefined();
     expect(reply.text).toContain("haven't done any of it");
   });
 
@@ -1221,7 +1236,7 @@ describe("executeBatch", () => {
         ],
       }),
     );
-    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.stage).toBeTruthy();
     expect(reply.text).toContain("Confirm these 2 changes?");
     expect(reply.text).toContain("<b>1. Set budget</b>");
     expect(reply.text).toContain("<b>2. Move transaction</b>");
@@ -1270,7 +1285,7 @@ describe("executeBatch", () => {
       env(),
       normalizeBatch({ actions: [{ action: "add_transaction", merchant: "water heater" }] }),
     );
-    expect(reply.confirmToken).toBeUndefined();
+    expect(reply.stage).toBeUndefined();
     expect(reply.text).toContain("No amount");
     expect(reply.text).toContain("<b>Add transaction</b>");
     expect(reply.text).toContain("water heater");
@@ -1290,7 +1305,7 @@ describe("executeBatch", () => {
         ],
       }),
     );
-    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.stage).toBeTruthy();
     expect(reply.text).toContain("$166.67");
     expect(reply.text).toContain("water heater");
     expect(reply.text).toContain("gift");
@@ -1460,5 +1475,289 @@ describe("yearly period", () => {
     expect(isPeriod("monthly")).toBe(true);
     expect(isPeriod("yearly")).toBe(true);
     expect(isPeriod("daily")).toBe(false);
+  });
+});
+
+/* ------------------------------------------------- ambiguous selectors */
+
+// Straight from the transcript that motivated all of this. Three $0.01 pre-auth
+// holds; one merchant name is a PREFIX of another; the unrelated one is newest.
+//
+// What used to happen:
+//   · "change FD *CA DMV 640 to $616, change FD *CA DMV 640 *SVC to $12.94"
+//     resolved step 1 to the *SVC row (newest LIKE match), leaving step 2 with
+//     nothing and rejecting the whole batch.
+//   · Re-sent as "change FD *CA DMV 640 from $0.01 to $616", the model read
+//     "from $0.01" as an AMOUNT selector, and applying re-ran it and landed on
+//     the newest $0.01 row — a different merchant entirely.
+const dmv = [
+  { id: 20, amount: 0.01, merchant: "SLC PANDA EXPRESS 62", occurred_at: "2026-09-06T20:00:00.000Z" },
+  { id: 31, amount: 0.01, merchant: "FD *CA DMV 640 *SVC", occurred_at: "2026-09-06T18:05:00.000Z" },
+  { id: 30, amount: 0.01, merchant: "FD *CA DMV 640", occurred_at: "2026-09-06T18:00:00.000Z" },
+];
+
+const correct = (selector: Record<string, unknown>, newAmount: number) => ({
+  action: "set_transaction_amount",
+  new_amount: newAmount,
+  ...selector,
+});
+
+const byMerchant = (value: string) => ({ selector_kind: "merchant", selector_value: value });
+
+describe("selector resolution across a batch", () => {
+  it("gives each of two overlapping merchant selectors its own charge", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({
+        actions: [
+          correct(byMerchant("FD *CA DMV 640"), 616),
+          correct(byMerchant("FD *CA DMV 640 *SVC"), 12.94),
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps.map((s) => s.txnId)).toEqual([30, 31]);
+  });
+
+  // Order of mention must not decide who gets the row: the same two steps the
+  // other way round still land on the same two charges.
+  it("resolves the same way whichever selector is stated first", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({
+        actions: [
+          correct(byMerchant("FD *CA DMV 640 *SVC"), 12.94),
+          correct(byMerchant("FD *CA DMV 640"), 616),
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps.map((s) => s.txnId)).toEqual([31, 30]);
+  });
+
+  // A merchant that exists under its own name is not ambiguous just because a
+  // longer name contains it.
+  it("prefers an exact merchant match over the row it is a prefix of", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({ actions: [correct(byMerchant("FD *CA DMV 640"), 616)] }),
+    );
+    expect(steps[0].ok).toBe(true);
+    expect(steps[0].txnId).toBe(30);
+  });
+
+  // Where nothing matches exactly, guessing is the bug. Report the choice.
+  it("reports a partial merchant match against two rows as a choice", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({ actions: [correct(byMerchant("DMV"), 616)] }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].text).toContain("2 transactions matching “DMV”");
+    expect(steps[0].candidates?.map((t) => t.id)).toEqual([31, 30]);
+  });
+
+  // Every pre-auth hold is $0.01, so an amount selector across three of them
+  // carries no information about which was meant.
+  it("reports identical amounts as a choice rather than taking the newest", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({ actions: [correct({ selector_kind: "amount", amount: 0.01 }, 616)] }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].candidates?.map((t) => t.id)).toEqual([20, 31, 30]);
+  });
+
+  it("names each option in the parse it shows back", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({ actions: [correct(byMerchant("DMV"), 616)] }),
+    );
+    const fields = Object.fromEntries(steps[0].view.fields);
+    expect(fields["Option 1"]).toBe("$0.01 — FD *CA DMV 640 *SVC (09-06)");
+    expect(fields["Option 2"]).toBe("$0.01 — FD *CA DMV 640 (09-06)");
+  });
+
+  // Past a handful, a list of buttons is not an answer — ask for a better
+  // selector instead of offering twelve near-identical rows.
+  it("refuses to offer a choice between too many matches", async () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({
+      id: 100 + i,
+      amount: 0.01,
+      merchant: `HOLD ${i}`,
+      occurred_at: "2026-09-06T18:00:00.000Z",
+    }));
+    const steps = await planBatch(
+      fakeEnv({ transactions: many }),
+      normalizeBatch({ actions: [correct({ selector_kind: "amount", amount: 0.01 }, 616)] }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].candidates).toBeUndefined();
+    expect(steps[0].text).toContain("too many to choose from");
+  });
+
+  // 'last' means "whatever is newest that nobody else claimed", so it must not
+  // take a row a named selector needs.
+  it("keeps 'last' off a row a named selector already claimed", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "merchant", selector_value: "SLC PANDA EXPRESS 62" },
+          { action: "remove_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps.map((s) => s.txnId)).toEqual([20, 31]);
+  });
+});
+
+describe("asking which charge", () => {
+  const ask = () =>
+    executeBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({ actions: [correct(byMerchant("DMV"), 616)] }),
+    );
+
+  it("asks instead of refusing outright", async () => {
+    const reply = await ask();
+    expect(reply.text).toContain("Which charge did you mean?");
+    expect(reply.text).not.toContain("I couldn't do that");
+    expect(reply.stage?.choices).toEqual([
+      "$0.01 — FD *CA DMV 640 *SVC (09-06)",
+      "$0.01 — FD *CA DMV 640 (09-06)",
+    ]);
+  });
+
+  it("stages the whole batch with the question", async () => {
+    const reply = await ask();
+    const batch = parsePending(reply.stage!.payload);
+    expect(batch.kind).toBe("disambiguate");
+    expect(batch.step).toBe(0);
+    expect(batch.candidates).toEqual([31, 30]);
+    expect(batch.actions).toHaveLength(1);
+  });
+
+  // The round trip a button tap makes: pin the chosen row onto the step that
+  // asked, re-plan, and the question becomes a confirmation.
+  it("turns an answer into a confirmation of that charge", async () => {
+    const batch = parsePending((await ask()).stage!.payload);
+    const answered = batch.actions.map((intent, i) =>
+      i === batch.step ? { ...intent, txnId: batch.candidates[1] } : intent,
+    );
+    const reply = await executeBatch(fakeEnv({ transactions: dmv }), answered);
+
+    expect(reply.text).toContain("Confirm this?");
+    expect(reply.text).toContain("$0.01 — FD *CA DMV 640 (09-06)");
+    expect(reply.stage?.choices).toBeUndefined();
+    expect(parsePending(reply.stage!.payload).kind).toBe("confirm");
+    expect(parsePending(reply.stage!.payload).actions[0].txnId).toBe(30);
+  });
+
+  // A hard failure elsewhere in the batch can't be answered away, so there is
+  // nothing to ask about.
+  it("reports a broken step rather than asking about another one", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({
+        actions: [correct(byMerchant("DMV"), 616), { action: "set_budget", amount: 0 }],
+      }),
+    );
+    expect(reply.stage).toBeUndefined();
+    expect(reply.text).toContain("haven't done any of it");
+  });
+});
+
+describe("pinned transactions", () => {
+  // The write that made this necessary: an approved correction re-ran its
+  // selector and updated a charge at a different merchant.
+  it("applies to the pinned row, not whatever the selector matches now", async () => {
+    const env = fakeEnv({ transactions: dmv });
+    await applyApproved(
+      env,
+      normalizeBatch({
+        actions: [correct({ selector_kind: "amount", amount: 0.01, txn_id: 30 }, 616)],
+      }),
+    );
+    const write = env.writes.find((w: any) => w.sql.includes("UPDATE transactions SET amount"));
+    expect(write.binds).toEqual([616, 30]);
+  });
+
+  it("names the pinned row in the outcome", async () => {
+    const text = await applyApproved(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({
+        actions: [correct({ selector_kind: "amount", amount: 0.01, txn_id: 30 }, 616)],
+      }),
+    );
+    expect(text).toContain("Changed FD *CA DMV 640 from $0.01");
+  });
+
+  it("reports a pinned row that has since been deleted", async () => {
+    const text = await applyApproved(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({
+        actions: [correct({ selector_kind: "amount", amount: 0.01, txn_id: 999 }, 616)],
+      }),
+    );
+    expect(text).toContain("no longer there");
+  });
+
+  // A batch staged before pinning existed, confirmed after this deployed: it
+  // carries a selector and no row id, and still has to apply.
+  it("falls back to the selector for a batch staged without a pin", async () => {
+    const env = fakeEnv({ transactions: dmv });
+    await applyApproved(
+      env,
+      normalizeBatch({ actions: [correct({ selector_kind: "amount", amount: 0.01 }, 616)] }),
+    );
+    const write = env.writes.find((w: any) => w.sql.includes("UPDATE transactions SET amount"));
+    expect(write.binds).toEqual([616, 20]);
+  });
+
+  it("carries the pin through a confirmation round trip", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: dmv }),
+      normalizeBatch({ actions: [correct(byMerchant("FD *CA DMV 640"), 616)] }),
+    );
+    const staged = parsePending(reply.stage!.payload);
+    expect(staged.actions[0].txnId).toBe(30);
+
+    const env = fakeEnv({ transactions: dmv });
+    await applyApproved(env, staged.actions);
+    const write = env.writes.find((w: any) => w.sql.includes("UPDATE transactions SET amount"));
+    expect(write.binds).toEqual([616, 30]);
+  });
+});
+
+describe("parsePending", () => {
+  it("reads a confirmation payload", () => {
+    const batch = parsePending(
+      JSON.stringify({ kind: "confirm", actions: [{ action: "set_budget", amount: 400 }] }),
+    );
+    expect(batch.kind).toBe("confirm");
+    expect(batch.actions[0].amount).toBe(400);
+  });
+
+  // Rows staged before payloads had a kind hold a bare action list. They must
+  // still apply on Yes, and must never read as an unanswered question.
+  it("treats a legacy payload as a confirmation", () => {
+    expect(parsePending(JSON.stringify([{ action: "set_budget", amount: 400 }])).kind).toBe("confirm");
+    expect(parsePending(JSON.stringify({ action: "set_budget", amount: 400 })).kind).toBe("confirm");
+  });
+
+  it("degrades a malformed payload to an empty confirmation", () => {
+    const batch = parsePending("{not json");
+    expect(batch.kind).toBe("confirm");
+    expect(batch.actions).toHaveLength(1);
+    expect(batch.actions[0].action).toBe("unknown");
+  });
+
+  it("drops candidate ids that aren't ids", () => {
+    const batch = parsePending(
+      JSON.stringify({ kind: "disambiguate", step: 1, candidates: [7, "x", -2, null], actions: [] }),
+    );
+    expect(batch.candidates).toEqual([7]);
   });
 });

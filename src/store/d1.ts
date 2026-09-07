@@ -316,7 +316,54 @@ export async function recentTransactions(env: Env, limit = 10): Promise<FullTxnR
   return res.results ?? [];
 }
 
+// One transaction by id. Used to re-read a row that was pinned at planning
+// time, so applying an approved change never re-runs the selector and never
+// lands on a different row than the one the user was shown.
+export async function getTransaction(env: Env, id: number): Promise<FullTxnRow | null> {
+  return await env.DB.prepare(
+    `SELECT id, amount, merchant, occurred_at, category_id FROM transactions WHERE id = ?`,
+  )
+    .bind(Number(id))
+    .first<FullTxnRow>();
+}
+
+// EVERY transaction a selector matches, newest first — not just the best one.
+//
+// A selector is user text and routinely matches more than one row: "FD *CA DMV
+// 640" is a prefix of "FD *CA DMV 640 *SVC", and a $0.01 pre-auth hold looks
+// exactly like every other $0.01 pre-auth hold. Returning one row silently
+// picked the newest of them; returning the list lets the caller notice the
+// ambiguity and ask instead of guessing.
+//
+// `limit` bounds the read, and callers ask for one more than they can act on so
+// they can tell "exactly N" from "at least N".
+export async function findTransactions(
+  env: Env,
+  kind: "last" | "amount" | "merchant",
+  value: string | number,
+  limit = 10,
+): Promise<FullTxnRow[]> {
+  const cols = `SELECT id, amount, merchant, occurred_at, category_id FROM transactions`;
+  const order = `ORDER BY occurred_at DESC, id DESC LIMIT ?`;
+  const n = Math.max(1, Math.min(50, Math.trunc(limit)));
+
+  const stmt =
+    kind === "last"
+      ? env.DB.prepare(`${cols} ${order}`).bind(n)
+      : kind === "amount"
+        ? // Tolerate float representation drift rather than comparing for equality.
+          env.DB.prepare(`${cols} WHERE ABS(amount - ?) < 0.005 ${order}`).bind(Number(value), n)
+        : env.DB.prepare(`${cols} WHERE merchant LIKE ? ${order}`).bind(`%${String(value)}%`, n);
+
+  const res = await stmt.all<FullTxnRow>();
+  return res.results ?? [];
+}
+
 // Locate one transaction for a move. Returns the newest match, or null.
+//
+// Superseded by findTransactions() for planning, which needs to see every
+// match. This remains for the one case that can't: applying a batch staged
+// before pinning existed, whose stored intent carries a selector and no row id.
 //
 // `excludeIds` skips rows already claimed by an earlier step of the same batch.
 // Without it, two "move the last charge" steps in one message both resolve to

@@ -207,6 +207,18 @@ export interface Intent {
   limit: number;
   purgeTransactions: boolean;
   reason: string;
+  /**
+   * The transaction this step resolved to, PINNED at planning time. 0 = not yet
+   * resolved.
+   *
+   * Not part of ACTION_SCHEMA and never set by the model — it is written by the
+   * planner and read back when an approved batch is applied, so applying acts on
+   * the row the user was actually shown. Re-running the selector at apply time
+   * instead is how "change FD *CA DMV 640" once landed on a $0.01 charge at a
+   * different merchant: the selector was ambiguous, and the second resolution
+   * picked differently from the first.
+   */
+  txnId: number;
 }
 
 // Which actions change stored data (and therefore need confirmation).
@@ -299,6 +311,9 @@ export function normalizeIntent(raw: unknown): Intent {
     // null or unparseable value must never read as "yes, delete the spending".
     purgeTransactions: bool(either("purge_transactions", "purgeTransactions")),
     reason: str(o.reason),
+    // Planner-set, never model-set: a pin round-trips through pending_actions
+    // as camelCase, and a batch staged before pinning existed has none at all.
+    txnId: Math.max(0, Math.trunc(num(either("txn_id", "txnId")))),
   };
 }
 
