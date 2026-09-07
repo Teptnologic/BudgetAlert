@@ -295,6 +295,17 @@ export async function setTxnAmount(env: Env, txnId: number, amount: number): Pro
     .run();
 }
 
+// Delete a transaction outright. Totals are summed live and nothing else
+// references the row, so it simply goes — no soft-delete flag that every other
+// query would then have to remember to filter on.
+//
+// The dedupe hash goes with it, so a bank re-delivering the same alert would
+// capture it again. That is the right reading of "remove this": the user is
+// saying the record is wrong, not asking to suppress that alert forever.
+export async function deleteTransaction(env: Env, txnId: number): Promise<void> {
+  await env.DB.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txnId).run();
+}
+
 export async function setTxnCategory(
   env: Env,
   txnId: number,

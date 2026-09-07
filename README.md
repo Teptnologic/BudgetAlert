@@ -58,6 +58,7 @@ mean:
 @budgetbot move the last $200 charge into yearly gift budget
 @budgetbot create a yearly gift budget of 1200
 @budgetbot change the last charge to $48.60
+@budgetbot delete the last charge
 @budgetbot how much did I spend on gifts this year?
 @budgetbot set my weekly budget to 400
 ```
@@ -94,6 +95,25 @@ them run.
 Correcting an amount (`change the last charge to $48.60`) is for when the captured
 figure is wrong — bank alerts frequently land pre-tip. Budget totals are summed
 live, so every status recomputes on the next read.
+
+Removing one (`delete the last charge`, `remove the $12 coffee`) is for a record
+that shouldn't exist at all — a charge that was never yours, or the same spend
+captured twice. It is the one action with nothing to undo it, so its confirmation
+names the row the selector actually landed on rather than just repeating the
+selector:
+
+```
+Confirm this?
+
+Remove transaction
+Which charge  Most recent charge
+Removing      $200.00 — TOP GOLF BAY RESERVA (07-22)
+                          [✅ Yes]  [✖️ No]
+```
+
+The row is deleted outright, dedupe hash and all — so if the bank re-sends that
+same alert it will be captured again. "Remove" means the record was wrong, not
+"never accept this alert".
 
 Anything that changes data shows a summary with **Yes / No** buttons and only
 applies on tap, so a misread amount can't silently move money.

@@ -294,6 +294,7 @@ describe("isMutating", () => {
     for (const a of [
       "move_transaction",
       "set_transaction_amount",
+      "remove_transaction",
       "set_budget",
       "create_category",
       "set_period",
@@ -316,7 +317,12 @@ describe("isMutating", () => {
 // offline. Exercises the real projection logic, which is the point of batching.
 function fakeEnv(opts: {
   categories?: { id: number; name: string; label: string; amount: number; period: string }[];
-  transactions?: { id: number; amount: number; merchant: string | null }[];
+  transactions?: {
+    id: number;
+    amount: number;
+    merchant: string | null;
+    occurred_at?: string;
+  }[];
 }): any {
   const cats = opts.categories ?? [];
   const txns = opts.transactions ?? []; // newest first
@@ -372,8 +378,10 @@ function fakeEnv(opts: {
 
 describe("planBatch projection", () => {
   const txns = [
-    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA" },
-    { id: 8, amount: 84, merchant: "STARBUCKS" },
+    // 04:00Z on the 23rd is 21:00 on the 22nd in US Pacific — the confirmation
+    // must show the local day, as the history listing does.
+    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA", occurred_at: "2026-07-23T04:00:00.000Z" },
+    { id: 8, amount: 84, merchant: "STARBUCKS", occurred_at: "2026-07-21T17:30:00.000Z" },
   ];
 
   // The case that motivates the whole feature: step 2 must validate against a
@@ -558,6 +566,7 @@ describe("describeIntent", () => {
     expect(view({ action: "add_transaction", amount: 1 }).title).toBe("Add transaction");
     expect(view({ action: "set_transaction_amount" }).title).toBe("Correct amount");
     expect(view({ action: "create_category" }).title).toBe("New budget envelope");
+    expect(view({ action: "remove_transaction" }).title).toBe("Remove transaction");
   });
 
   it("describes a manual transaction field by field", () => {
@@ -605,6 +614,137 @@ describe("describeIntent", () => {
   it("distinguishes a category budget from the main one", () => {
     expect(asMap({ action: "set_budget", amount: 400 }).Budget).toBe("Main budget");
     expect(asMap({ action: "set_budget", amount: 400, category: "gift" }).Budget).toBe("gift");
+  });
+});
+
+/* ---------------------------------------------------------------- removal */
+
+// Deleting is the only action with nothing to undo it, so it gets its own
+// coverage: that it resolves like the other selector actions, and that the
+// confirmation names the row it landed on rather than just the selector.
+describe("remove_transaction", () => {
+  // Typed rather than inferred so a fixture may omit the date, which is the
+  // "still resolves a row that has no usable date" case below.
+  type Fixture = { id: number; amount: number; merchant: string | null; occurred_at?: string };
+  const txns: Fixture[] = [
+    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA", occurred_at: "2026-07-23T04:00:00.000Z" },
+    { id: 8, amount: 84, merchant: "STARBUCKS", occurred_at: "2026-07-21T17:30:00.000Z" },
+  ];
+  const plan = (raw: any, transactions: Fixture[] = txns) =>
+    planBatch(fakeEnv({ transactions }), normalizeBatch({ actions: [raw] }));
+
+  it("counts as a write, so it can never be answered without a tap", () => {
+    expect(isMutating("remove_transaction")).toBe(true);
+    expect(batchMutates(normalizeBatch({ actions: [{ action: "remove_transaction" }] }))).toBe(true);
+  });
+
+  it("plans a removal against the most recent charge", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "last" });
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("Remove $200.00");
+    expect(step.text).toContain("TOP GOLF BAY RESERVA");
+  });
+
+  it("picks a charge by amount", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "amount", amount: 84 });
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("STARBUCKS");
+  });
+
+  it("picks a charge by merchant", async () => {
+    const [step] = await plan({
+      action: "remove_transaction",
+      selector_kind: "merchant",
+      selector_value: "starbucks",
+    });
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("$84.00");
+  });
+
+  // The point of the whole feature's safety story: "Most recent charge" does not
+  // say WHICH charge, and there is no undo, so the plan resolves it for the user.
+  it("names the row the selector landed on, with its local date", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "last" });
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Which charge"]).toBe("Most recent charge");
+    expect(fields["Removing"]).toBe("$200.00 — TOP GOLF BAY RESERVA (07-22)");
+  });
+
+  it("still resolves a row that has no usable date", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "last" }, [
+      { id: 1, amount: 5, merchant: "CASH" },
+    ]);
+    expect(step.ok).toBe(true);
+    expect(Object.fromEntries(step.view.fields)["Removing"]).toBe("$5.00 — CASH");
+  });
+
+  it("refuses when it can't tell which charge was meant", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "none" });
+    expect(step.ok).toBe(false);
+    expect(step.text).toContain("Couldn't tell which charge");
+  });
+
+  it("reports a selector that matches nothing", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "amount", amount: 999 });
+    expect(step.ok).toBe(false);
+    expect(step.text).toContain("No transaction matching $999.00");
+  });
+
+  // Same claim tracking as the other selector actions: without it both steps
+  // resolve to the newest row and one deletion silently targets it twice.
+  it("does not resolve two removals to the same transaction", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: txns }),
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "remove_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("TOP GOLF BAY RESERVA");
+    expect(steps[1].text).toContain("STARBUCKS");
+  });
+
+  it("keeps a removal and a move on separate rows", async () => {
+    const steps = await planBatch(
+      fakeEnv({
+        categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+        transactions: txns,
+      }),
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("TOP GOLF BAY RESERVA");
+    expect(steps[1].text).toContain("STARBUCKS");
+  });
+
+  it("stages behind a confirmation instead of acting", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: txns }),
+      normalizeBatch({ actions: [{ action: "remove_transaction", selector_kind: "last" }] }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("Confirm this?");
+    expect(reply.text).toContain("<b>Remove transaction</b>");
+    expect(reply.text).toContain("TOP GOLF BAY RESERVA (07-22)");
+  });
+
+  // A merchant name is user-supplied text and reaches the confirmation twice —
+  // once via the selector, once via the resolved row. Both must be escaped.
+  it("escapes a merchant name in the resolved field", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: [{ id: 1, amount: 9, merchant: "A & B <b>", occurred_at: "2026-07-22T19:00:00.000Z" }] }),
+      normalizeBatch({ actions: [{ action: "remove_transaction", selector_kind: "last" }] }),
+    );
+    expect(reply.text).toContain("A &amp; B &lt;b&gt;");
+    expect(reply.text).not.toContain("A & B <b>");
   });
 });
 

@@ -253,6 +253,7 @@ export async function applyApproved(env: Env, intents: Intent[]): Promise<string
     "add_transaction",
     "move_transaction",
     "set_transaction_amount",
+    "remove_transaction",
     "set_budget",
   ];
   if (intents.some((i) => changesRemaining.includes(i.action))) {

@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { calendarFrom } from "../env";
 import type { Intent } from "./schema";
 import { isMutating } from "./schema";
-import { isPeriod, daysAgo, type Period } from "../core/period";
+import { isPeriod, daysAgo, type Period, type Calendar } from "../core/period";
 import { formatMoney } from "../core/engine";
 import {
   getConfig,
@@ -26,6 +26,7 @@ import {
   setCategoryBudget,
   setTxnCategory,
   setTxnAmount,
+  deleteTransaction,
   setBudget,
   setPeriod,
 } from "../store/d1";
@@ -36,6 +37,16 @@ export interface PlannedStep {
   text: string;
   /** The parsed intent, shown so a misparse is visible before approval. */
   view: IntentView;
+}
+
+// What planStep returns before the view is attached. `resolved` carries fields
+// that only exist once the step has been checked against live data — which row
+// a selector actually landed on, say — and they are appended to the view.
+interface StepPlan {
+  ok: boolean;
+  text: string;
+  /** Raw text, not HTML: fieldLines() in execute.ts escapes these. */
+  resolved?: [label: string, value: string][];
 }
 
 // How the intent is shown back to the user before they approve it. This is the
@@ -50,6 +61,7 @@ const TITLES: Record<string, string> = {
   add_transaction: "Add transaction",
   move_transaction: "Move transaction",
   set_transaction_amount: "Correct amount",
+  remove_transaction: "Remove transaction",
   set_budget: "Set budget",
   create_category: "New budget envelope",
   set_period: "Change budget window",
@@ -97,6 +109,12 @@ export function describeIntent(intent: Intent, currency: string): IntentView {
       add("New amount", money(intent.newAmount));
       break;
 
+    // Deliberately thin: the row this resolves to is added by planStep, which
+    // is the only place that can look it up.
+    case "remove_transaction":
+      add("Which charge", which());
+      break;
+
     case "set_budget":
       add("Budget", intent.category ? intent.category : "Main budget");
       add("New limit", money(intent.amount));
@@ -137,10 +155,36 @@ interface Projection {
   budgetAmount: number;
   period: Period;
   currency: string;
+  calendar: Calendar;
 }
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// "No transaction matching …" — shared by the three actions that resolve a
+// single existing transaction from a selector, so the wording can't drift apart.
+function noMatchText(intent: Intent, money: (n: number) => string, fallback: string): string {
+  const what =
+    intent.selectorKind === "amount"
+      ? `matching ${money(intent.amount)}`
+      : intent.selectorKind === "merchant"
+        ? `matching “${esc(intent.selectorValue)}”`
+        : fallback;
+  return `⚠️ No transaction ${what}.`;
+}
+
+// The transaction's date as a LOCAL day. Returns null for a row with no usable
+// date rather than letting Intl throw on an invalid one.
+function localDay(iso: string | undefined, cal: Calendar): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: cal.timeZone,
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
 }
 
 async function buildProjection(env: Env): Promise<Projection> {
@@ -160,17 +204,14 @@ async function buildProjection(env: Env): Promise<Projection> {
     budgetAmount: cfg.budget_amount,
     period: isPeriod(cfg.period) ? cfg.period : "weekly",
     currency: cfg.currency,
+    calendar: calendarFrom(env),
   };
 }
 
 /* ------------------------------------------------------------------- plan */
 
 // Validate one step against the projection and, if valid, advance it.
-async function planStep(
-  env: Env,
-  intent: Intent,
-  p: Projection,
-): Promise<Omit<PlannedStep, "view">> {
+async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPlan> {
   const money = (n: number) => formatMoney(n, p.currency);
 
   switch (intent.action) {
@@ -247,15 +288,7 @@ async function planStep(
       // Exclude rows an earlier step already claimed, so "move the last two
       // charges" doesn't resolve to the same transaction twice.
       const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) {
-        const what =
-          intent.selectorKind === "amount"
-            ? `matching ${money(intent.amount)}`
-            : intent.selectorKind === "merchant"
-              ? `matching “${esc(intent.selectorValue)}”`
-              : "to move";
-        return { ok: false, text: `⚠️ No transaction ${what}.` };
-      }
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to move") };
       p.claimedTxnIds.push(txn.id);
       return {
         ok: true,
@@ -272,21 +305,33 @@ async function planStep(
       }
       const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
       const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) {
-        const what =
-          intent.selectorKind === "amount"
-            ? `matching ${money(intent.amount)}`
-            : intent.selectorKind === "merchant"
-              ? `matching “${esc(intent.selectorValue)}”`
-              : "to change";
-        return { ok: false, text: `⚠️ No transaction ${what}.` };
-      }
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to change") };
       p.claimedTxnIds.push(txn.id);
       return {
         ok: true,
         text:
           `Change ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
           `to <b>${money(intent.newAmount)}</b>`,
+      };
+    }
+
+    case "remove_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to remove") };
+      p.claimedTxnIds.push(txn.id);
+      const who = txn.merchant ?? "unknown";
+      const day = localDay(txn.occurred_at, p.calendar);
+      return {
+        ok: true,
+        text: `Remove ${money(txn.amount)} — ${esc(who)}`,
+        // Deletion is the one action with nothing to undo it, and "Most recent
+        // charge" doesn't say WHICH charge that is. Name the row the selector
+        // actually landed on, so a wrong target is visible before the tap.
+        resolved: [["Removing", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`]],
       };
     }
 
@@ -307,8 +352,12 @@ export async function planBatch(env: Env, intents: Intent[]): Promise<PlannedSte
   const projection = await buildProjection(env);
   const steps: PlannedStep[] = [];
   for (const intent of intents) {
-    const step = await planStep(env, intent, projection);
-    steps.push({ ...step, view: describeIntent(intent, projection.currency) });
+    const { resolved, ...step } = await planStep(env, intent, projection);
+    const view = describeIntent(intent, projection.currency);
+    steps.push({
+      ...step,
+      view: resolved?.length ? { ...view, fields: [...view.fields, ...resolved] } : view,
+    });
   }
   return steps;
 }
@@ -404,6 +453,21 @@ async function applyStep(
         text:
           `Changed ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
           `to <b>${money(intent.newAmount)}</b>`,
+      };
+    }
+
+    case "remove_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "That removal is no longer valid" };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      if (!txn) return { ok: false, text: "That transaction is no longer there" };
+      claimed.push(txn.id);
+      await deleteTransaction(env, txn.id);
+      return {
+        ok: true,
+        text: `Removed ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")}`,
       };
     }
 

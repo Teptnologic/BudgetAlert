@@ -15,7 +15,11 @@
 // So: irrelevant fields carry sentinels ("" / 0 / "none") instead of being
 // absent or null, and normalizeIntent() below turns that back into a typed
 // discriminated union for the rest of the app. Current counts, keep them low:
-//   required params: 11 (1 wrapper + 10 item)   optional: 0   anyOf/type-array: 0
+//   required params: 16 (1 wrapper + 15 item)   optional: 0   anyOf/type-array: 0
+//
+// Adding an ACTION is cheap under this shape — a new enum value costs no new
+// parameter, so it does not move any of those counts. Adding a FIELD is what
+// has to be justified against them.
 
 export const MAX_ACTIONS = 5;
 
@@ -49,6 +53,7 @@ const ACTION_SCHEMA = {
         "add_transaction",
         "move_transaction",
         "set_transaction_amount",
+        "remove_transaction",
         "set_budget",
         "create_category",
         "set_period",
@@ -69,7 +74,7 @@ const ACTION_SCHEMA = {
     amount: {
       type: "number",
       description:
-        "The money amount in the message. For add_transaction, how much was spent. For set_budget and create_category, the budget limit. For move_transaction and set_transaction_amount with selector_kind 'amount', the amount that identifies which existing transaction is meant. 0 only when the message truly has no amount.",
+        "The money amount in the message. For add_transaction, how much was spent. For set_budget and create_category, the budget limit. For move_transaction, set_transaction_amount and remove_transaction with selector_kind 'amount', the amount that identifies which existing transaction is meant. 0 only when the message truly has no amount.",
     },
     new_amount: {
       type: "number",
@@ -112,7 +117,7 @@ const ACTION_SCHEMA = {
       type: "string",
       enum: ["last", "amount", "merchant", "none"],
       description:
-        "How to find the transaction for move_transaction. 'last' = most recent. 'none' when not applicable.",
+        "How to find the transaction for move_transaction, set_transaction_amount, or remove_transaction. 'last' = most recent. 'none' when not applicable.",
     },
     selector_value: {
       type: "string",
@@ -161,6 +166,7 @@ export type Action =
   | "add_transaction"
   | "move_transaction"
   | "set_transaction_amount"
+  | "remove_transaction"
   | "set_budget"
   | "create_category"
   | "set_period"
@@ -195,6 +201,7 @@ const MUTATING: ReadonlySet<Action> = new Set<Action>([
   "add_transaction",
   "move_transaction",
   "set_transaction_amount",
+  "remove_transaction",
   "set_budget",
   "create_category",
   "set_period",
