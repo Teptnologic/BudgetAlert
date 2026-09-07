@@ -10,7 +10,7 @@ import {
   unknownIntent,
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
-import { executeBatch } from "../src/nl/execute";
+import { executeBatch, scheduledReportText } from "../src/nl/execute";
 import { periodStart, periodStartAt, periodEnd, periodLabel, daysAgo, isPeriod, type Calendar } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
@@ -877,6 +877,29 @@ describe("report", () => {
   it("labels the period it covers", async () => {
     const reply = await run({ window: "quarter" });
     expect(reply.text).toMatch(/Q[1-4] \d{4}/);
+  });
+
+  // The cron path must not post "Nothing recorded" to the group every quarter,
+  // but someone who typed /report still deserves an answer.
+  it("stays silent for the cron on an empty period, but answers a direct ask", async () => {
+    const quiet = fakeEnv({ transactions: [] });
+    expect(await scheduledReportText(quiet, "quarter", 1)).toBeNull();
+
+    const asked = await executeBatch(
+      quiet,
+      normalizeBatch({ actions: [{ action: "report", window: "quarter", period_offset: 1 }] }),
+    );
+    expect(asked.text).toContain("Nothing recorded");
+  });
+
+  it("returns the same report the command does when there is spending", async () => {
+    const env = fakeEnv({ transactions: txns, categories: cats });
+    const scheduled = await scheduledReportText(env, "quarter", 0);
+    const asked = await executeBatch(
+      env,
+      normalizeBatch({ actions: [{ action: "report", window: "quarter", period_offset: 0 }] }),
+    );
+    expect(scheduled).toBe(asked.text);
   });
 
   it("says so plainly when a period is empty", async () => {

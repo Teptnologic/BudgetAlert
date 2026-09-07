@@ -3,12 +3,20 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Weekly summary — Sunday 16:00 UTC, which is 9am Pacific during daylight
-# saving and 8am in winter. Cron is always UTC, so the local hour shifts by one
-# across DST; that's cosmetic for a summary. Sunday morning is chosen so the
-# digest covers the week that just ended, given weeks now begin Sunday.
+# Cron is always UTC, so the local hour shifts by one across DST; that is
+# cosmetic for a digest. All three fire in the morning Pacific, on the first day
+# of the new period, so each covers the period that just ended.
+#
+#   0 16 * * SUN       weekly digest, Sunday ~9am Pacific (weeks begin Sunday)
+#   0 17 1 1,4,7,10 *  quarterly report, Jan/Apr/Jul/Oct 1st
+#   0 18 1 1 *         yearly report, Jan 1st
+#
+# Jan 1 matches both report crons, hence the staggered hours: they arrive an
+# hour apart rather than racing. src/core/schedule.ts reads the SHAPE of these
+# expressions, not their exact text, so shifting an hour keeps them working.
+# Delete a line to turn that report off; a monthly one would be "0 17 1 * *".
 [triggers]
-crons = ["0 16 * * SUN"]
+crons = ["0 16 * * SUN", "0 17 1 1,4,7,10 *", "0 18 1 1 *"]
 
 # D1 database. Create it with:  wrangler d1 create budgetalert
 # then paste the returned database_id below.

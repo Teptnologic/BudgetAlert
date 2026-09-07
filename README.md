@@ -8,7 +8,8 @@ against a budget, and:
 - 📊 Posts a **weekly summary** on a schedule
 - 💬 Answers **on-demand checks** — message `/status` in the group to see what's left
 - 🗂 Tracks **budget envelopes** — a yearly gift budget separate from your weekly spend
-- 📈 Reports a whole **week, month, quarter or year** on demand — `/report quarter`
+- 📈 Reports a whole **week, month, quarter or year** — on demand, and posted
+  automatically when a quarter or a year closes
 - 🗣 Understands **plain English** — `@bot move the last $200 charge into yearly gift budget`
 
 No bank credentials, no Plaid, nothing to poll. Bank alert → email → Worker.
@@ -38,6 +39,7 @@ different chat platform later means swapping an adapter, not a rewrite.
 | `src/core/parser.ts` | Turns an alert email into `{ amount, merchant, currency }` or `null` |
 | `src/core/engine.ts` | Budget status + which threshold alerts to fire |
 | `src/core/period.ts` | Week/month/quarter/year period boundaries, in a real timezone |
+| `src/core/schedule.ts` | Which job a cron firing is asking for |
 | `src/service.ts` | Ties core → storage → Telegram (the shared pipeline) |
 | `src/store/d1.ts` | D1 data layer (the only DB-specific module) |
 | `src/notify/telegram.ts` | Delivery channel |
@@ -48,7 +50,7 @@ different chat platform later means swapping an adapter, not a rewrite.
 | `src/nl/execute.ts` | Reads (status, history, reports) + staging writes for confirmation |
 | `src/nl/plan.ts` | Dry-run validation of a batch, then applying the approved plan |
 | `src/router.ts` | HTTP routes: `/telegram`, `/inbound`, health |
-| `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` |
+| `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` (digest + period reports) |
 
 ## Natural language
 
@@ -198,6 +200,33 @@ Everything together: $350.00 across 3 transactions
 In natural language, *"how did last quarter go?"* or *"give me a yearly report"*
 does the same.
 
+### Reports that arrive on their own
+
+Two of them are also posted to the group on a schedule, alongside the weekly
+digest:
+
+| Cron | When | What arrives |
+|---|---|---|
+| `0 16 * * SUN` | Sunday ~9am Pacific | Weekly digest |
+| `0 17 1 1,4,7,10 *` | Jan/Apr/Jul/Oct 1st | Report on the quarter that just ended |
+| `0 18 1 1 *` | Jan 1st | Report on the year that just ended |
+
+Each fires on the **first day of the new period and reports the previous one** —
+a quarterly report sent on Oct 1 covers Q3, not the six hours of Q4 that exist
+by then. Jan 1 matches both report crons, so their hours are staggered an hour
+apart rather than racing.
+
+`src/core/schedule.ts` decides which report a firing wants from the *shape* of
+the cron expression, not its exact text, so shifting an hour doesn't silently
+turn a yearly report back into a weekly digest. Delete a line from
+`[triggers] crons` to turn one off; `0 17 1 * *` would add a monthly one.
+
+A period with no spending at all sends nothing — a quiet quarter shouldn't post
+"Nothing recorded" to the group. Asking directly still answers.
+
+Scheduled reports involve no model call, so they work without
+`ANTHROPIC_API_KEY`.
+
 The budget line only appears when the report covers the same cadence your budget
 resets on. `$300.00 of $500.00` is a fact about a week and nonsense about a
 quarter — thirteen weekly budgets aren't one quarterly limit — so a mismatched
@@ -321,8 +350,9 @@ extraction on a latency-sensitive webhook path, and compiled grammars are cached
 only ~24h from last use — a low-traffic personal bot would often pay Opus
 compile latency for no accuracy gain. Switch it if you disagree.
 
-Weekly-summary schedule lives in `[triggers] crons` (default: Sunday 16:00 UTC —
-9am Pacific in summer, 8am in winter, since cron is always UTC).
+Schedules live in `[triggers] crons` — the weekly digest plus the quarterly and
+yearly reports. See [Reports that arrive on their own](#reports-that-arrive-on-their-own).
+Cron is always UTC, so the local hour shifts by one across daylight saving.
 
 ### Weeks and timezones
 

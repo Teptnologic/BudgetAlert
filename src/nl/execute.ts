@@ -4,8 +4,8 @@
 
 import type { Env } from "../env";
 import { calendarFrom } from "../env";
-import type { Intent } from "./schema";
-import { isMutating, batchMutates } from "./schema";
+import type { Intent, Window } from "./schema";
+import { isMutating, batchMutates, normalizeIntent } from "./schema";
 import { planBatch, applyBatch, type StepOutcome } from "./plan";
 import {
   isPeriod,
@@ -103,7 +103,7 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
       return await listTransactions(env, intent, cfg.currency);
 
     case "report":
-      return await reportText(env, intent, cfg);
+      return (await buildReport(env, intent, cfg)).text;
 
     default:
       return intent.reason || "I didn't follow that. Try /help for what I understand.";
@@ -192,7 +192,15 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
 // Deliberately NOT list_transactions. That prints every row, which is right for
 // a week and unreadable for a quarter or a year in a chat message. This answers
 // "how did Q3 go?" in a screenful regardless of how much was spent.
-async function reportText(env: Env, intent: Intent, cfg: ConfigRow): Promise<string> {
+// `empty` is reported separately from the text so a scheduled report can stay
+// silent on a quiet period instead of posting "Nothing recorded" to the group,
+// while someone who explicitly asked still gets an answer.
+interface Report {
+  text: string;
+  empty: boolean;
+}
+
+async function buildReport(env: Env, intent: Intent, cfg: ConfigRow): Promise<Report> {
   const cal = calendarFrom(env);
   const period = windowPeriod(intent.window);
   const start = periodStartAt(period, intent.periodOffset, new Date(), cal);
@@ -213,7 +221,7 @@ async function reportText(env: Env, intent: Intent, cfg: ConfigRow): Promise<str
   const main = totals.find((t) => t.category_id === null) ?? { n: 0, total: 0 };
   const grand = totals.reduce((sum, t) => sum + t.total, 0);
   const grandN = totals.reduce((sum, t) => sum + t.n, 0);
-  if (!grandN) return `${heading}\nNothing recorded.`;
+  if (!grandN) return { text: `${heading}\nNothing recorded.`, empty: true };
 
   const out: string[] = [heading, ""];
 
@@ -262,7 +270,20 @@ async function reportText(env: Env, intent: Intent, cfg: ConfigRow): Promise<str
   }
 
   out.push("", `<b>Everything together: ${money(grand)}</b> across ${txns(grandN)}`);
-  return out.join("\n");
+  return { text: out.join("\n"), empty: false };
+}
+
+// A report for the cron path: the same one the /report command produces, but
+// null when the period had no spending at all, so a quiet quarter posts nothing.
+export async function scheduledReportText(
+  env: Env,
+  window: Window,
+  periodOffset: number,
+): Promise<string | null> {
+  const cfg = await getConfig(env);
+  const intent = normalizeIntent({ action: "report", window, period_offset: periodOffset });
+  const report = await buildReport(env, intent, cfg);
+  return report.empty ? null : report.text;
 }
 
 function reportWord(period: Period): string {
