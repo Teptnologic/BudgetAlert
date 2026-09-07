@@ -8,6 +8,7 @@
 //   /budget <amount>                 → set the budget amount
 //   /period weekly|…|yearly          → set the budget window
 //   /report [week|…|year] [last|N]   → aggregated summary for a whole period
+//   /history [last|N|YYYY-MM-DD]     → one week of spending, or one named day
 //   /categories                      → list budget envelopes
 //   /setgroup                        → register this chat for alerts & summaries
 //   /help                            → command list
@@ -35,7 +36,7 @@ import {
   type Keyboard,
 } from "../notify/telegram";
 import { formatMoney } from "../core/engine";
-import { isPeriod, periodStart } from "../core/period";
+import { isPeriod, periodStart, localDayIso, daysAgo } from "../core/period";
 import { interpret } from "../nl/interpret";
 import { executeBatch, applyApproved, parsePending, type Reply } from "../nl/execute";
 import { normalizeBatch } from "../nl/schema";
@@ -269,18 +270,41 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
     }
 
     // Deterministic path for the common case, so a week's history costs no
-    // model call:  /history  ·  /history last  ·  /history 2
+    // model call:
+    //   /history  ·  /history last  ·  /history 2  ·  /history 2026-07-19
+    //   /history today  ·  /history yesterday
     case "/history": {
       const a = arg.trim().toLowerCase();
-      const offset = a.startsWith("last") ? 1 : Number.parseInt(a, 10) || 0;
-      const reply = await executeBatch(
-        env,
-        normalizeBatch({
-          actions: [
-            { action: "list_transactions", window: "week", period_offset: offset, scope: "main" },
-          ],
-        }),
+      const cal = calendarFrom(env);
+      // A single date is spelled out, so it needs no interpretation — but the
+      // two day words people actually type do, and resolving them here keeps
+      // them off the model path too. Both must resolve in the budget's
+      // timezone: "today" read in UTC is tomorrow for most of a US evening.
+      //
+      // Anything date-SHAPED is taken as a day even when it isn't a real date,
+      // so /history 2026-13-45 asks which day rather than falling through to
+      // Number.parseInt's 2026 and reporting an empty week 520 weeks back.
+      const typed = a.replace(
+        /^(\d{4})-(\d{1,2})-(\d{1,2})$/,
+        (_m, y, mo, d) => `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`,
       );
+      const day =
+        a === "today"
+          ? localDayIso(new Date(), cal)
+          : a === "yesterday"
+            ? localDayIso(daysAgo(1, new Date(), cal), cal)
+            : /^\d{4}-\d{2}-\d{2}$/.test(typed)
+              ? typed
+              : "";
+      const action = day
+        ? { action: "list_transactions", window: "day", date: day, scope: "main" }
+        : {
+            action: "list_transactions",
+            window: "week",
+            period_offset: a.startsWith("last") ? 1 : Number.parseInt(a, 10) || 0,
+            scope: "main",
+          };
+      const reply = await executeBatch(env, normalizeBatch({ actions: [action] }));
       await sendMessage(env, chat, reply.text);
       return;
     }
@@ -353,7 +377,8 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "/budget &lt;amount&gt; — set your main budget\n" +
           "/period weekly|monthly|quarterly|yearly — set the budget window\n" +
           "/report [week|month|quarter|year] [last|N] — period summary\n" +
-          "/history [last|N] — this week's spending, or N weeks back\n" +
+          "/history [last|N|YYYY-MM-DD] — this week's spending, N weeks back,\n" +
+          "  or one day (also <code>today</code> / <code>yesterday</code>)\n" +
           "/categories — list budget envelopes\n" +
           "/setgroup — send alerts &amp; summaries here\n" +
           "/help — this message\n\n" +
@@ -367,6 +392,7 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "<i>@bot delete the gift budget</i>\n" +
           "<i>@bot how did last quarter go?</i>\n" +
           "<i>@bot show my spending last week</i>\n" +
+          "<i>@bot show history of 2026-07-19</i>\n" +
           "<i>@bot show all of my gift spending</i>\n" +
           "<i>@bot how much did I spend on gifts this year?</i>",
       );

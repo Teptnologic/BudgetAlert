@@ -15,11 +15,13 @@
 // So: irrelevant fields carry sentinels ("" / 0 / "none") instead of being
 // absent or null, and normalizeIntent() below turns that back into a typed
 // discriminated union for the rest of the app. Current counts, keep them low:
-//   required params: 17 (1 wrapper + 16 item)   optional: 0   anyOf/type-array: 0
+//   required params: 18 (1 wrapper + 17 item)   optional: 0   anyOf/type-array: 0
 //
 // Adding an ACTION is cheap under this shape — a new enum value costs no new
 // parameter, so it does not move any of those counts. Adding a FIELD is what
 // has to be justified against them.
+
+import { parseLocalDay } from "../core/period";
 
 export const MAX_ACTIONS = 5;
 
@@ -34,6 +36,7 @@ const ACTION_SCHEMA = {
     "amount",
     "new_amount",
     "days_ago",
+    "date",
     "period",
     "window",
     "period_offset",
@@ -95,6 +98,11 @@ const ACTION_SCHEMA = {
       description:
         "For add_transaction: how many days back the spend happened. 0 = today, 1 = yesterday. Use 0 unless the user says otherwise.",
     },
+    date: {
+      type: "string",
+      description:
+        "For window 'day' ONLY: the single calendar date being asked about, as YYYY-MM-DD in the user's local timezone. Resolve relative wording against today's date given above — 'yesterday' becomes that date, not a day count. Empty string for every other window.",
+    },
     period: {
       type: "string",
       enum: ["weekly", "monthly", "quarterly", "yearly", "none"],
@@ -102,9 +110,9 @@ const ACTION_SCHEMA = {
     },
     window: {
       type: "string",
-      enum: ["week", "month", "quarter", "year", "all", "none"],
+      enum: ["day", "week", "month", "quarter", "year", "all", "none"],
       description:
-        "Time window for query_spend, list_transactions and report. week/month/quarter/year are whole calendar periods, not rolling day counts. 'all' means every transaction ever, with no date limit — use it for 'all my gift spending' or 'everything I've ever spent on X'. Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
+        "Time window for query_spend, list_transactions and report. week/month/quarter/year are whole calendar periods, not rolling day counts. 'day' is ONE named calendar date and requires the date field. 'all' means every transaction ever, with no date limit — use it for 'all my gift spending' or 'everything I've ever spent on X'. Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
     },
     period_offset: {
       type: "integer",
@@ -185,7 +193,7 @@ export type Action =
   | "unknown";
 
 export type SelectorKind = "last" | "amount" | "merchant" | "none";
-export type Window = "week" | "month" | "quarter" | "year" | "all" | "none";
+export type Window = "day" | "week" | "month" | "quarter" | "year" | "all" | "none";
 export type Scope = "main" | "category" | "all";
 export type PeriodOrNone = "weekly" | "monthly" | "quarterly" | "yearly" | "none";
 
@@ -198,6 +206,8 @@ export interface Intent {
   amount: number;
   newAmount: number;
   daysAgo: number;
+  /** For window 'day': the date asked about, as YYYY-MM-DD. "" when none. */
+  date: string;
   period: PeriodOrNone;
   window: Window;
   periodOffset: number;
@@ -279,7 +289,24 @@ function num(raw: unknown): number {
 export function normalizeIntent(raw: unknown): Intent {
   const o = (raw ?? {}) as Record<string, unknown>;
   const either = (snake: string, camel: string): unknown => o[snake] ?? o[camel];
-  const action = pickEnum<Action>(o.action, ACTIONS, "unknown");
+  const rawAction = pickEnum<Action>(o.action, ACTIONS, "unknown");
+
+  // 'all' has no calendar meaning for a report, which is by construction the
+  // summary of ONE period. Coerced rather than rejected so "report on
+  // everything" answers with the year instead of silently reading as a week.
+  const window = ((): Window => {
+    const w = pickEnum<Window>(o.window, WINDOWS, "none");
+    return rawAction === "report" && w === "all" ? "year" : w;
+  })();
+
+  // A single day is not a period either, and there is nothing left to aggregate
+  // over one: the envelope breakdown and top-merchant list of a handful of
+  // charges IS the listing. Reporting the surrounding week instead would answer
+  // over a range the user never named, so the action moves rather than the
+  // window.
+  const action: Action =
+    rawAction === "report" && window === "day" ? "list_transactions" : rawAction;
+
   const amount = Math.abs(num(o.amount));
   const newAmount = Math.abs(num(either("new_amount", "newAmount")));
   return {
@@ -294,14 +321,12 @@ export function normalizeIntent(raw: unknown): Intent {
     // Clamped to a year: a mistyped 20260 must not backdate spend out of every
     // budget period and silently vanish from the totals.
     daysAgo: Math.min(365, Math.max(0, Math.trunc(num(either("days_ago", "daysAgo"))))),
+    // Kept only when it is a real calendar date. A malformed or impossible one
+    // becomes "" and the day handlers ask for a date, rather than a query
+    // silently running over a rolled-over day the user never asked about.
+    date: parseLocalDay(str(o.date)) ? str(o.date) : "",
     period: pickEnum<PeriodOrNone>(o.period, PERIODS, "none"),
-    // 'all' has no calendar meaning for a report, which is by construction the
-    // summary of ONE period. Coerced rather than rejected so "report on
-    // everything" answers with the year instead of silently reading as a week.
-    window: (() => {
-      const w = pickEnum<Window>(o.window, WINDOWS, "none");
-      return action === "report" && w === "all" ? "year" : w;
-    })(),
+    window,
     // Bounded: an unbounded offset would silently query an empty range far in
     // the past and read as "you spent nothing" rather than as a bad request.
     periodOffset: Math.min(520, Math.max(0, Math.trunc(num(either("period_offset", "periodOffset"))))),

@@ -11,7 +11,18 @@ import {
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
 import { executeBatch, applyApproved, parsePending, scheduledReportText } from "../src/nl/execute";
-import { periodStart, periodStartAt, periodEnd, periodLabel, daysAgo, isPeriod, type Calendar } from "../src/core/period";
+import {
+  periodStart,
+  periodStartAt,
+  periodEnd,
+  periodLabel,
+  daysAgo,
+  dayRange,
+  dayLabel,
+  localDayIso,
+  isPeriod,
+  type Calendar,
+} from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
 // `anyOf` or type arrays; exceeding the grammar's limits fails with
@@ -405,6 +416,27 @@ function fakeEnv(opts: {
         },
         async all() {
           if (sql.includes("FROM categories")) return { results: cats };
+          // listBetween(): a half-open [since, until) range, oldest first. The
+          // ORDER BY is what identifies it — the GROUP BY aggregates below carry
+          // the same range clause. Filtered for real, so a day- or week-bounded
+          // listing can be tested rather than always coming back empty.
+          if (sql.includes("ORDER BY occurred_at ASC, id ASC")) {
+            const [since, until] = binds;
+            let pool = txns.filter(
+              (t) => (t.occurred_at ?? "") >= since && (t.occurred_at ?? "") < until,
+            );
+            if (sql.includes("category_id = ?")) {
+              pool = pool.filter((t) => (t as any).category_id === binds[2]);
+            } else if (sql.includes("category_id IS NULL")) {
+              pool = pool.filter((t) => ((t as any).category_id ?? null) === null);
+            }
+            return {
+              results: [...pool].sort(
+                (a, b) =>
+                  (a.occurred_at ?? "").localeCompare(b.occurred_at ?? "") || a.id - b.id,
+              ),
+            };
+          }
           // findTransactions(): every match, newest first, bounded by LIMIT.
           // Matched narrowly so the GROUP BY aggregates below still reach theirs.
           if (sql.includes("ORDER BY occurred_at DESC, id DESC LIMIT ?")) {
@@ -965,6 +997,189 @@ describe("all-time envelope history", () => {
   it("leaves 'all' alone on a listing", () => {
     const i = normalizeBatch({ actions: [{ action: "list_transactions", window: "all" }] })[0];
     expect(i.window).toBe("all");
+  });
+});
+
+/* ------------------------------------------------------- single-day history */
+
+// "@bot show history of 2026-07-19" — one named calendar date. Before this the
+// intent had nowhere to put a date at all: window carried only whole periods
+// and period_offset counted weeks, so the closest answer was the surrounding
+// week, which is not what was asked.
+describe("single-day history", () => {
+  // Deliberately straddling the day's LOCAL boundaries. In US Pacific,
+  // 2026-07-19 runs from 07-19T07:00Z to 07-20T07:00Z.
+  const txns = [
+    { id: 5, amount: 11, merchant: "NEXT DAY", category_id: null, occurred_at: "2026-07-20T07:00:00.000Z" }, // 00:00 PDT the 20th
+    { id: 4, amount: 60, merchant: "LATE DINNER", category_id: null, occurred_at: "2026-07-20T06:30:00.000Z" }, // 23:30 PDT the 19th
+    { id: 3, amount: 25, merchant: "GIFT SHOP", category_id: 1, occurred_at: "2026-07-19T19:00:00.000Z" },
+    { id: 2, amount: 40, merchant: "CORNER CAFE", category_id: null, occurred_at: "2026-07-19T16:00:00.000Z" },
+    { id: 1, amount: 99, merchant: "PREV DAY", category_id: null, occurred_at: "2026-07-19T06:59:00.000Z" }, // 23:59 PDT the 18th
+  ];
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const run = (raw: any) =>
+    executeBatch(
+      fakeEnv({ transactions: txns, categories: cats }),
+      normalizeBatch({ actions: [{ window: "day", date: "2026-07-19", ...raw }] }),
+    );
+
+  it("lists the charges of exactly that date", async () => {
+    const reply = await run({ action: "list_transactions" });
+    expect(reply.text).toContain("CORNER CAFE");
+    expect(reply.text).toContain("2026-07-19");
+    expect(reply.text).toContain("$100.00"); // 40 + 60, main budget only
+  });
+
+  // The whole reason day boundaries are computed locally: a 23:30 dinner in
+  // California is already the next day in UTC, and a UTC range would file it
+  // under the 20th — the same class of bug the week math was written to avoid.
+  it("keeps a late-evening local charge on the day it was spent", async () => {
+    const reply = await run({ action: "list_transactions" });
+    expect(reply.text).toContain("LATE DINNER");
+    expect(reply.text).not.toContain("NEXT DAY");
+  });
+
+  it("excludes the previous day, right up to local midnight", async () => {
+    const reply = await run({ action: "list_transactions" });
+    expect(reply.text).not.toContain("PREV DAY");
+  });
+
+  it("scopes a day to one envelope", async () => {
+    const reply = await run({ action: "list_transactions", scope: "category", category: "gift" });
+    expect(reply.text).toContain("GIFT SHOP");
+    expect(reply.text).not.toContain("CORNER CAFE");
+    expect(reply.text).toContain("$25.00");
+  });
+
+  it("says so plainly when nothing was spent that day", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: txns, categories: cats }),
+      normalizeBatch({
+        actions: [{ action: "list_transactions", window: "day", date: "2026-07-15" }],
+      }),
+    );
+    expect(reply.text).toContain("Nothing recorded");
+    expect(reply.text).toContain("2026-07-15");
+  });
+
+  // The day total must agree to the cent with the day listing, or the two
+  // answers to the same question contradict each other.
+  it("answers a spend question over the same range as the listing", async () => {
+    const reply = await run({ action: "query_spend" });
+    expect(reply.text).toContain("$100.00");
+    expect(reply.text).toContain("2026-07-19");
+  });
+
+  // Guessing "today" would answer confidently about the wrong day.
+  it("asks for a date rather than guessing when it can't read one", async () => {
+    for (const date of ["", "last thursday", "07/19/2026", "2026-02-30"]) {
+      const reply = await run({ action: "list_transactions", date });
+      expect(reply.text).toContain("Which day?");
+      expect(reply.text).not.toContain("CORNER CAFE");
+    }
+  });
+
+  it("asks for a date on a spend question too", async () => {
+    const reply = await run({ action: "query_spend", date: "nonsense" });
+    expect(reply.text).toContain("Which day?");
+  });
+
+  // A day is not a period, so there is no report of one — the listing already
+  // shows every charge. Answering with the surrounding week would silently
+  // widen the range the user named.
+  it("turns a one-day report into the listing for that day", async () => {
+    const i = normalizeBatch({
+      actions: [{ action: "report", window: "day", date: "2026-07-19" }],
+    })[0];
+    expect(i.action).toBe("list_transactions");
+    expect(i.window).toBe("day");
+  });
+
+  it("leaves reports of real periods alone", () => {
+    const i = normalizeBatch({ actions: [{ action: "report", window: "month" }] })[0];
+    expect(i.action).toBe("report");
+  });
+});
+
+describe("date normalization", () => {
+  const dateOf = (raw: any) => normalizeBatch({ actions: [raw] })[0].date;
+
+  it("keeps a real calendar date", () => {
+    expect(dateOf({ action: "list_transactions", window: "day", date: "2026-07-19" })).toBe(
+      "2026-07-19",
+    );
+  });
+
+  // Date would roll 2026-02-30 into March. A history quietly answered for the
+  // 2nd when the user typed the 30th is worse than saying it didn't parse.
+  it("drops a date that does not exist", () => {
+    expect(dateOf({ action: "list_transactions", window: "day", date: "2026-02-30" })).toBe("");
+    expect(dateOf({ action: "list_transactions", window: "day", date: "2026-13-01" })).toBe("");
+  });
+
+  it("drops anything that is not YYYY-MM-DD", () => {
+    for (const bad of ["07/19/2026", "19-07-2026", "2026-7-9", "yesterday", "2026-07-19T00:00Z"]) {
+      expect(dateOf({ action: "list_transactions", window: "day", date: bad })).toBe("");
+    }
+  });
+
+  it("survives the camelCase round trip through pending_actions", () => {
+    const staged = normalizeBatch({
+      actions: [{ action: "list_transactions", window: "day", date: "2026-07-19" }],
+    });
+    const back = normalizeBatch(JSON.parse(JSON.stringify({ actions: staged })));
+    expect(back[0].date).toBe("2026-07-19");
+    expect(back[0].window).toBe("day");
+  });
+});
+
+describe("day ranges", () => {
+  it("runs from local midnight to the next local midnight", () => {
+    const r = dayRange("2026-07-19", PT)!;
+    expect(inPT(r.start)).toBe("2026-07-19 00:00");
+    expect(inPT(r.end)).toBe("2026-07-20 00:00");
+  });
+
+  // Half-open on both ends, so no charge falls into two days or between them.
+  it("abuts the neighbouring days exactly", () => {
+    expect(dayRange("2026-07-19", PT)!.end.toISOString()).toBe(
+      dayRange("2026-07-20", PT)!.start.toISOString(),
+    );
+  });
+
+  // 23 hours long locally, but still midnight to midnight. A fixed 24-hour span
+  // would end an hour into the next day.
+  it("stays on local midnight across a spring-forward day", () => {
+    const r = dayRange("2026-03-08", PT)!;
+    expect(inPT(r.start)).toBe("2026-03-08 00:00");
+    expect(inPT(r.end)).toBe("2026-03-09 00:00");
+    expect(r.end.getTime() - r.start.getTime()).toBe(23 * 3600 * 1000);
+  });
+
+  it("is 25 hours long across a fall-back day, still midnight to midnight", () => {
+    const r = dayRange("2026-11-01", PT)!;
+    expect(inPT(r.start)).toBe("2026-11-01 00:00");
+    expect(inPT(r.end)).toBe("2026-11-02 00:00");
+    expect(r.end.getTime() - r.start.getTime()).toBe(25 * 3600 * 1000);
+  });
+
+  it("rejects impossible and malformed dates", () => {
+    for (const bad of ["2026-02-30", "2026-00-10", "", "tomorrow", "2026-7-19"]) {
+      expect(dayRange(bad, PT)).toBeNull();
+    }
+  });
+
+  it("accepts a leap day in a leap year and refuses it otherwise", () => {
+    expect(dayRange("2028-02-29", PT)).not.toBeNull();
+    expect(dayRange("2026-02-29", PT)).toBeNull();
+  });
+
+  // Reads as the local day, not the UTC one: 07:00Z on the 19th is still the
+  // 19th in California, but 06:00Z is the evening of the 18th.
+  it("names the local day an instant falls on", () => {
+    expect(localDayIso(new Date("2026-07-19T07:00:00Z"), PT)).toBe("2026-07-19");
+    expect(localDayIso(new Date("2026-07-19T06:59:59Z"), PT)).toBe("2026-07-18");
+    expect(dayLabel(new Date("2026-07-19T16:00:00Z"), PT)).toBe("Sunday, 2026-07-19");
   });
 });
 
