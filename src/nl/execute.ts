@@ -15,6 +15,8 @@ import {
   periodEnd,
   periodLabel,
   daysAgo,
+  dayRange,
+  dayLabel,
   type Period,
   type Calendar,
 } from "../core/period";
@@ -102,8 +104,14 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// A report/listing window as a budget period. 'none' and 'all' have no calendar
-// meaning, so callers that can receive them decide what to do before calling this.
+// A 'day' window the model left without a usable date. Asking beats guessing:
+// defaulting to today would answer confidently about the wrong day.
+const NEED_DATE =
+  "Which day? Give me a date like <code>2026-07-19</code> — I couldn't read one in that.";
+
+// A report/listing window as a budget period. 'none', 'all' and 'day' have no
+// calendar period, so callers that can receive them decide what to do before
+// calling this.
 function windowPeriod(window: Intent["window"]): Period {
   if (window === "year") return "yearly";
   if (window === "quarter") return "quarterly";
@@ -154,6 +162,25 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
         );
       }
 
+      // One named day is a bounded range, not a rolling window: summed from the
+      // day's own rows so it agrees to the cent with the listing for that day.
+      if (intent.window === "day") {
+        const range = dayRange(intent.date, cal);
+        if (!range) return NEED_DATE;
+        const rows = await listBetween(
+          env,
+          range.start.toISOString(),
+          range.end.toISOString(),
+          cat ? { kind: "category", id: cat.id } : { kind: "main" },
+        );
+        const total = rows.reduce((sum, r) => sum + r.amount, 0);
+        return (
+          `${esc(dayLabel(range.start, cal))} on ${scope}: ` +
+          `<b>${formatMoney(total, cfg.currency)}</b> across ${rows.length} ` +
+          `transaction${rows.length === 1 ? "" : "s"}`
+        );
+      }
+
       const days =
         intent.window === "year"
           ? 365
@@ -179,7 +206,8 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
 }
 
 // Spending history. With a window it covers one whole calendar period (this
-// week, last week, …); without one it falls back to the most recent N.
+// week, last week, …) or one named date; without one it falls back to the most
+// recent N.
 async function listTransactions(env: Env, intent: Intent, currency: string): Promise<string> {
   const cal = calendarFrom(env);
   const cats = await listCategories(env);
@@ -205,7 +233,15 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
   // history rather than for the rows that happened to fit.
   let capped: { n: number; total: number } | null = null;
 
-  if (intent.window === "all") {
+  if (intent.window === "day") {
+    // One named calendar date, bounded by LOCAL midnights — the same half-open
+    // range a period uses, so a charge can never fall between two days or land
+    // in the wrong one because the instant was read in UTC.
+    const range = dayRange(intent.date, cal);
+    if (!range) return NEED_DATE;
+    rows = await listBetween(env, range.start.toISOString(), range.end.toISOString(), scope);
+    heading = `${esc(scopeLabel)} — ${esc(dayLabel(range.start, cal))}`;
+  } else if (intent.window === "all") {
     // Everything, ever. The rows are capped to what a chat message can hold,
     // but the count and total below come from the unbounded query.
     const totals = await sumScope(env, scope);

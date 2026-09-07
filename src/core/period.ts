@@ -199,3 +199,74 @@ export function daysAgo(
 ): Date {
   return startOfLocalDay(addDays(localDate(now, cal.timeZone), -n), cal.timeZone);
 }
+
+/* --------------------------------------------------------- single-day math */
+
+// A single named day is not a budget period — it has no cadence and never
+// resets — so it lives beside Period rather than inside it. What it shares with
+// a period is the only thing callers need: a half-open [start, end) instant
+// range, computed on LOCAL midnights, that composes with listBetween exactly as
+// a week or a month does.
+
+const ISO_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Parse a plain `YYYY-MM-DD` calendar date.
+ *
+ * Returns null for anything that isn't one, INCLUDING dates that don't exist:
+ * `new Date(Date.UTC(2026, 1, 30))` silently rolls into March, and a history
+ * quietly answered for March 2nd when the user typed February 30th is worse
+ * than saying the date didn't parse.
+ */
+export function parseLocalDay(text: string): LocalDate | null {
+  const m = ISO_DAY.exec(text.trim());
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  if (
+    probe.getUTCFullYear() !== year ||
+    probe.getUTCMonth() + 1 !== month ||
+    probe.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return { year, month, day };
+}
+
+/**
+ * The instants bounding one local calendar day: [local midnight, the next
+ * local midnight). Null when the date isn't a real one.
+ *
+ * The end is the start of the FOLLOWING day rather than 23:59:59 of this one,
+ * so a charge at 23:59:30 is included and none can fall between two days.
+ */
+export function dayRange(
+  text: string,
+  cal: Calendar = DEFAULT_CALENDAR,
+): { start: Date; end: Date } | null {
+  const d = parseLocalDay(text);
+  if (!d) return null;
+  return {
+    start: startOfLocalDay(d, cal.timeZone),
+    end: startOfLocalDay(addDays(d, 1), cal.timeZone),
+  };
+}
+
+/** The local calendar date an instant falls on, as `YYYY-MM-DD`. */
+export function localDayIso(instant: Date, cal: Calendar = DEFAULT_CALENDAR): string {
+  const d = localDate(instant, cal.timeZone);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.year}-${pad(d.month)}-${pad(d.day)}`;
+}
+
+/** How one day reads in a heading: "Sunday, 2026-07-19". */
+export function dayLabel(instant: Date, cal: Calendar = DEFAULT_CALENDAR): string {
+  const d = localDate(instant, cal.timeZone);
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    timeZone: "UTC",
+  }).format(new Date(Date.UTC(d.year, d.month - 1, d.day)));
+  return `${weekday}, ${localDayIso(instant, cal)}`;
+}

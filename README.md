@@ -275,7 +275,8 @@ you want the shape of a period, and a history when you want the rows.
 ## Spending history
 
 `/history` lists this week's spending against the main budget; `/history last`
-steps back a week, `/history 3` three weeks. In natural language, *"show my
+steps back a week, `/history 3` three weeks, and `/history 2026-07-19` shows one
+named date. In natural language, *"show my
 spending last week"* does the same, and you can ask for a month, a year, or one
 envelope.
 
@@ -285,6 +286,30 @@ main budget — last week (week of 2026-07-20)
 07-23  $30.00 — CINEMA
 Total: $125.00 across 2 transactions
 ```
+
+### One named day
+
+`/history 2026-07-19` lists that date alone, as do `/history today` and
+`/history yesterday`. In natural language, *"show history of 2026-07-19"*,
+*"what did I spend on July 19?"* and *"yesterday's charges"* all work, and take
+an envelope or a spend question the same way a week does.
+
+```
+main budget — Sunday, 2026-07-19
+07-19  $40.00 — CORNER CAFE
+07-19  $60.00 — LATE DINNER
+Total: $100.00 across 2 transactions
+```
+
+A day runs from local midnight to local midnight, not from 00:00 UTC. An 11:30pm
+dinner in California is already tomorrow in UTC, and a UTC range would file it
+under the following day — the same bug the week math is written to avoid.
+
+There is no *report* of a single day: with a handful of charges the listing
+already is the summary, so asking for one returns the day's rows rather than
+quietly widening to the surrounding week. And a date that can't be read is
+asked about rather than guessed — defaulting to today would answer confidently
+about the wrong day.
 
 **Only main-budget spending is counted by default.** Because envelopes are
 exclusive, money filed into a named envelope isn't weekly spending — a $166.67
