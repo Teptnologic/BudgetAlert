@@ -102,9 +102,9 @@ const ACTION_SCHEMA = {
     },
     window: {
       type: "string",
-      enum: ["week", "month", "quarter", "year", "none"],
+      enum: ["week", "month", "quarter", "year", "all", "none"],
       description:
-        "Time window for query_spend, list_transactions and report. These are whole calendar periods, not rolling day counts. Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
+        "Time window for query_spend, list_transactions and report. week/month/quarter/year are whole calendar periods, not rolling day counts. 'all' means every transaction ever, with no date limit — use it for 'all my gift spending' or 'everything I've ever spent on X'. Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
     },
     period_offset: {
       type: "integer",
@@ -185,7 +185,7 @@ export type Action =
   | "unknown";
 
 export type SelectorKind = "last" | "amount" | "merchant" | "none";
-export type Window = "week" | "month" | "quarter" | "year" | "none";
+export type Window = "week" | "month" | "quarter" | "year" | "all" | "none";
 export type Scope = "main" | "category" | "all";
 export type PeriodOrNone = "weekly" | "monthly" | "quarterly" | "yearly" | "none";
 
@@ -295,7 +295,13 @@ export function normalizeIntent(raw: unknown): Intent {
     // budget period and silently vanish from the totals.
     daysAgo: Math.min(365, Math.max(0, Math.trunc(num(either("days_ago", "daysAgo"))))),
     period: pickEnum<PeriodOrNone>(o.period, PERIODS, "none"),
-    window: pickEnum<Window>(o.window, WINDOWS, "none"),
+    // 'all' has no calendar meaning for a report, which is by construction the
+    // summary of ONE period. Coerced rather than rejected so "report on
+    // everything" answers with the year instead of silently reading as a week.
+    window: (() => {
+      const w = pickEnum<Window>(o.window, WINDOWS, "none");
+      return action === "report" && w === "all" ? "year" : w;
+    })(),
     // Bounded: an unbounded offset would silently query an empty range far in
     // the past and read as "you spent nothing" rather than as a bad request.
     periodOffset: Math.min(520, Math.max(0, Math.trunc(num(either("period_offset", "periodOffset"))))),
