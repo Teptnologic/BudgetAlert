@@ -98,9 +98,9 @@ live, so every status recomputes on the next read.
 
 Removing one (`delete the last charge`, `remove the $12 coffee`) is for a record
 that shouldn't exist at all — a charge that was never yours, or the same spend
-captured twice. It is the one action with nothing to undo it, so its confirmation
-names the row the selector actually landed on rather than just repeating the
-selector:
+captured twice. Nothing restores the row afterwards, so the confirmation names
+the row the selector actually landed on rather than just repeating the selector
+back:
 
 ```
 Confirm this?

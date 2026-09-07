@@ -328,9 +328,11 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
       return {
         ok: true,
         text: `Remove ${money(txn.amount)} — ${esc(who)}`,
-        // Deletion is the one action with nothing to undo it, and "Most recent
-        // charge" doesn't say WHICH charge that is. Name the row the selector
-        // actually landed on, so a wrong target is visible before the tap.
+        // "Most recent charge" doesn't say WHICH charge that is, so a
+        // selector-only confirmation asks for a blind approval. Name the row
+        // the selector actually landed on instead. move_transaction and
+        // set_transaction_amount have the same blind spot and can use this
+        // too; removal goes first because it takes the whole row at once.
         resolved: [["Removing", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`]],
       };
     }
