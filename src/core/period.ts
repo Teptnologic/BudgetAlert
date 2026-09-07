@@ -9,7 +9,7 @@
 // instant at the end, so adding "7 days" across a daylight-saving change lands
 // on local midnight rather than drifting an hour.
 
-export type Period = "weekly" | "monthly" | "yearly";
+export type Period = "weekly" | "monthly" | "quarterly" | "yearly";
 
 /** 0 = weeks begin Sunday, 1 = weeks begin Monday. */
 export type WeekStart = 0 | 1;
@@ -25,7 +25,14 @@ export const DEFAULT_CALENDAR: Calendar = {
 };
 
 export function isPeriod(value: string): value is Period {
-  return value === "weekly" || value === "monthly" || value === "yearly";
+  return (
+    value === "weekly" || value === "monthly" || value === "quarterly" || value === "yearly"
+  );
+}
+
+/** The calendar month a quarter begins in: 1, 4, 7 or 10. */
+function quarterStartMonth(month: number): number {
+  return Math.floor((month - 1) / 3) * 3 + 1;
 }
 
 interface LocalDate {
@@ -121,6 +128,15 @@ export function periodStartAt(
   if (period === "yearly") {
     return startOfLocalDay({ year: today.year - back, month: 1, day: 1 }, cal.timeZone);
   }
+  if (period === "quarterly") {
+    // Snap to the quarter this date sits in, then step back whole quarters.
+    // The UTC probe carries a negative month index into the previous year.
+    const q = new Date(Date.UTC(today.year, quarterStartMonth(today.month) - 1 - back * 3, 1));
+    return startOfLocalDay(
+      { year: q.getUTCFullYear(), month: q.getUTCMonth() + 1, day: 1 },
+      cal.timeZone,
+    );
+  }
   // Month arithmetic via a UTC probe so December rolls the year correctly.
   const m = new Date(Date.UTC(today.year, today.month - 1 - back, 1));
   return startOfLocalDay(
@@ -144,6 +160,13 @@ export function periodEnd(
   if (period === "yearly") {
     return startOfLocalDay({ year: d.year + 1, month: 1, day: 1 }, cal.timeZone);
   }
+  if (period === "quarterly") {
+    const q = new Date(Date.UTC(d.year, d.month - 1 + 3, 1));
+    return startOfLocalDay(
+      { year: q.getUTCFullYear(), month: q.getUTCMonth() + 1, day: 1 },
+      cal.timeZone,
+    );
+  }
   const m = new Date(Date.UTC(d.year, d.month, 1)); // month is 1-based, so this is next month
   return startOfLocalDay(
     { year: m.getUTCFullYear(), month: m.getUTCMonth() + 1, day: 1 },
@@ -160,6 +183,7 @@ export function periodLabel(
   const pad = (n: number) => String(n).padStart(2, "0");
   if (period === "weekly") return `week of ${d.year}-${pad(d.month)}-${pad(d.day)}`;
   if (period === "yearly") return String(d.year);
+  if (period === "quarterly") return `Q${Math.floor((d.month - 1) / 3) + 1} ${d.year}`;
   return new Date(Date.UTC(d.year, d.month - 1, 1)).toLocaleString("en-US", {
     month: "long",
     year: "numeric",

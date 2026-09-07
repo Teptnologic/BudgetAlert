@@ -176,7 +176,7 @@ function thresholdMessage(
   );
 }
 
-function progressBar(pct: number): string {
+export function progressBar(pct: number): string {
   const filled = Math.max(0, Math.min(10, Math.round(pct / 10)));
   return "█".repeat(filled) + "░".repeat(10 - filled);
 }

@@ -4,8 +4,8 @@
 
 import type { Env } from "../env";
 import { calendarFrom } from "../env";
-import type { Intent } from "./schema";
-import { isMutating, batchMutates } from "./schema";
+import type { Intent, Window } from "./schema";
+import { isMutating, batchMutates, normalizeIntent } from "./schema";
 import { planBatch, applyBatch, type StepOutcome } from "./plan";
 import {
   isPeriod,
@@ -16,8 +16,8 @@ import {
   daysAgo,
   type Period,
 } from "../core/period";
-import { formatMoney } from "../core/engine";
-import { budgetStatusText } from "../service";
+import { formatMoney, computeStatus } from "../core/engine";
+import { budgetStatusText, progressBar } from "../service";
 import {
   getConfig,
   listCategories,
@@ -25,8 +25,11 @@ import {
   recentTransactions,
   listBetween,
   sumSince,
+  totalsByCategory,
+  topMerchants,
   type TxnScope,
   type FullTxnRow,
+  type ConfigRow,
 } from "../store/d1";
 
 export interface Reply {
@@ -38,6 +41,16 @@ export interface Reply {
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
+// A report/listing window as a budget period. 'none' has no calendar meaning,
+// so callers that can receive it decide what to do before calling this.
+function windowPeriod(window: Intent["window"]): Period {
+  if (window === "year") return "yearly";
+  if (window === "quarter") return "quarterly";
+  if (window === "month") return "monthly";
+  return "weekly";
+}
+
 
 function token(): string {
   // Short + opaque: Telegram caps callback_data at 64 bytes, so the batch is
@@ -68,7 +81,14 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
     }
 
     case "query_spend": {
-      const days = intent.window === "year" ? 365 : intent.window === "month" ? 30 : 7;
+      const days =
+        intent.window === "year"
+          ? 365
+          : intent.window === "quarter"
+            ? 91
+            : intent.window === "month"
+              ? 30
+              : 7;
       const since = daysAgo(days, new Date(), cal).toISOString();
       const cat = intent.category ? await findCategory(env, intent.category) : null;
       if (intent.category && !cat) {
@@ -81,6 +101,9 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
 
     case "list_transactions":
       return await listTransactions(env, intent, cfg.currency);
+
+    case "report":
+      return (await buildReport(env, intent, cfg)).text;
 
     default:
       return intent.reason || "I didn't follow that. Try /help for what I understand.";
@@ -126,8 +149,7 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
       .reverse(); // oldest first, so it reads as a chronology
     heading = `Last ${rows.length} on ${esc(scopeLabel)}`;
   } else {
-    const period: Period =
-      intent.window === "year" ? "yearly" : intent.window === "month" ? "monthly" : "weekly";
+    const period = windowPeriod(intent.window);
     const start = periodStartAt(period, intent.periodOffset, new Date(), cal);
     const end = periodEnd(period, start, cal);
     rows = await listBetween(env, start.toISOString(), end.toISOString(), scope);
@@ -162,6 +184,116 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
     `<code>${lines.join("\n")}</code>\n` +
     `<b>Total: ${formatMoney(total, currency)}</b> across ${rows.length} transaction${rows.length === 1 ? "" : "s"}`
   );
+}
+
+// An aggregated report over one whole calendar period: how the main budget did,
+// what each envelope did, and the biggest merchants.
+//
+// Deliberately NOT list_transactions. That prints every row, which is right for
+// a week and unreadable for a quarter or a year in a chat message. This answers
+// "how did Q3 go?" in a screenful regardless of how much was spent.
+// `empty` is reported separately from the text so a scheduled report can stay
+// silent on a quiet period instead of posting "Nothing recorded" to the group,
+// while someone who explicitly asked still gets an answer.
+interface Report {
+  text: string;
+  empty: boolean;
+}
+
+async function buildReport(env: Env, intent: Intent, cfg: ConfigRow): Promise<Report> {
+  const cal = calendarFrom(env);
+  const period = windowPeriod(intent.window);
+  const start = periodStartAt(period, intent.periodOffset, new Date(), cal);
+  const end = periodEnd(period, start, cal);
+  const startIso = start.toISOString();
+  const endIso = end.toISOString();
+
+  const [totals, top, cats] = await Promise.all([
+    totalsByCategory(env, startIso, endIso),
+    topMerchants(env, startIso, endIso, 5),
+    listCategories(env),
+  ]);
+
+  const money = (n: number) => formatMoney(n, cfg.currency);
+  const label = periodLabel(period, start, cal);
+  const heading = `📊 <b>${esc(label)}</b>${intent.periodOffset === 0 ? " so far" : ""}`;
+
+  const main = totals.find((t) => t.category_id === null) ?? { n: 0, total: 0 };
+  const grand = totals.reduce((sum, t) => sum + t.total, 0);
+  const grandN = totals.reduce((sum, t) => sum + t.n, 0);
+  if (!grandN) return { text: `${heading}\nNothing recorded.`, empty: true };
+
+  const out: string[] = [heading, ""];
+
+  // The budget line only means something when the report covers the same
+  // cadence the budget resets on — "$1,240 of $500" for a quarter on a weekly
+  // budget would read as a catastrophic overspend rather than 13 weeks of them.
+  const txns = (n: number) => `${n} transaction${n === 1 ? "" : "s"}`;
+  if (cfg.budget_amount > 0 && cfg.period === period) {
+    const status = computeStatus(cfg.budget_amount, main.total, cfg.currency);
+    out.push(
+      "<b>Main budget</b>",
+      `${progressBar(status.pct)} ${status.pct.toFixed(0)}%`,
+      `Spent: ${money(status.spent)} of ${money(status.budget)} across ${txns(main.n)}`,
+      `Remaining: <b>${money(status.remaining)}</b>`,
+    );
+  } else {
+    out.push("<b>Main budget</b>", `Spent: <b>${money(main.total)}</b> across ${txns(main.n)}`);
+    if (cfg.budget_amount > 0) {
+      out.push(
+        `<i>Your budget resets ${esc(cfg.period)}, so there's no single limit to compare a ` +
+          `${esc(reportWord(period))} against.</i>`,
+      );
+    }
+  }
+
+  if (cats.length) {
+    const byId = new Map(totals.filter((t) => t.category_id !== null).map((t) => [t.category_id, t]));
+    const lines = cats.map((c) => {
+      const t = byId.get(c.id) ?? { n: 0, total: 0 };
+      // Show the envelope's own limit only when it resets on the same cadence
+      // the report covers, for the same reason the main budget line does.
+      const of = c.period === period ? ` of ${money(c.amount)}` : "";
+      return `• ${esc(c.label)}: ${money(t.total)}${of} across ${txns(t.n)}`;
+    });
+    out.push("", "<b>Envelopes</b>", ...lines);
+  }
+
+  if (top.length) {
+    out.push(
+      "",
+      "<b>Biggest merchants</b>",
+      ...top.map(
+        (m) => `• ${money(m.total)} — ${esc(m.merchant ?? "unknown")}${m.n > 1 ? ` (${m.n}×)` : ""}`,
+      ),
+    );
+  }
+
+  out.push("", `<b>Everything together: ${money(grand)}</b> across ${txns(grandN)}`);
+  return { text: out.join("\n"), empty: false };
+}
+
+// A report for the cron path: the same one the /report command produces, but
+// null when the period had no spending at all, so a quiet quarter posts nothing.
+export async function scheduledReportText(
+  env: Env,
+  window: Window,
+  periodOffset: number,
+): Promise<string | null> {
+  const cfg = await getConfig(env);
+  const intent = normalizeIntent({ action: "report", window, period_offset: periodOffset });
+  const report = await buildReport(env, intent, cfg);
+  return report.empty ? null : report.text;
+}
+
+function reportWord(period: Period): string {
+  return period === "yearly"
+    ? "year"
+    : period === "quarterly"
+      ? "quarter"
+      : period === "monthly"
+        ? "month"
+        : "week";
 }
 
 async function readReplies(env: Env, intents: Intent[]): Promise<string> {
@@ -253,6 +385,9 @@ export async function applyApproved(env: Env, intents: Intent[]): Promise<string
     "add_transaction",
     "move_transaction",
     "set_transaction_amount",
+    "remove_transaction",
+    "unfile_transaction",
+    "delete_category",
     "set_budget",
   ];
   if (intents.some((i) => changesRemaining.includes(i.action))) {

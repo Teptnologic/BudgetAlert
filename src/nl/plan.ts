@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { calendarFrom } from "../env";
 import type { Intent } from "./schema";
 import { isMutating } from "./schema";
-import { isPeriod, daysAgo, type Period } from "../core/period";
+import { isPeriod, daysAgo, type Period, type Calendar } from "../core/period";
 import { formatMoney } from "../core/engine";
 import {
   getConfig,
@@ -26,6 +26,9 @@ import {
   setCategoryBudget,
   setTxnCategory,
   setTxnAmount,
+  deleteTransaction,
+  deleteCategory,
+  categoryTotals,
   setBudget,
   setPeriod,
 } from "../store/d1";
@@ -36,6 +39,16 @@ export interface PlannedStep {
   text: string;
   /** The parsed intent, shown so a misparse is visible before approval. */
   view: IntentView;
+}
+
+// What planStep returns before the view is attached. `resolved` carries fields
+// that only exist once the step has been checked against live data — which row
+// a selector actually landed on, say — and they are appended to the view.
+interface StepPlan {
+  ok: boolean;
+  text: string;
+  /** Raw text, not HTML: fieldLines() in execute.ts escapes these. */
+  resolved?: [label: string, value: string][];
 }
 
 // How the intent is shown back to the user before they approve it. This is the
@@ -50,14 +63,18 @@ const TITLES: Record<string, string> = {
   add_transaction: "Add transaction",
   move_transaction: "Move transaction",
   set_transaction_amount: "Correct amount",
+  remove_transaction: "Remove transaction",
+  unfile_transaction: "Return to main budget",
   set_budget: "Set budget",
   create_category: "New budget envelope",
+  delete_category: "Delete budget envelope",
   set_period: "Change budget window",
 };
 
 const PERIOD_WORDS: Record<string, string> = {
   weekly: "Weekly",
   monthly: "Monthly",
+  quarterly: "Quarterly",
   yearly: "Yearly",
 };
 
@@ -95,6 +112,24 @@ export function describeIntent(intent: Intent, currency: string): IntentView {
     case "set_transaction_amount":
       add("Which charge", which());
       add("New amount", money(intent.newAmount));
+      break;
+
+    // Deliberately thin: the row this resolves to is added by planStep, which
+    // is the only place that can look it up.
+    case "remove_transaction":
+      add("Which charge", which());
+      break;
+
+    case "unfile_transaction":
+      add("Which charge", which());
+      add("Move into", "Main budget");
+      break;
+
+    case "delete_category":
+      add("Envelope", intent.categoryLabel || intent.category || "—");
+      // The flag is the whole safety story here, so it is stated as a field
+      // rather than left implicit in the summary line.
+      add("Its charges", intent.purgeTransactions ? "Deleted too" : "Return to main budget");
       break;
 
     case "set_budget":
@@ -137,10 +172,44 @@ interface Projection {
   budgetAmount: number;
   period: Period;
   currency: string;
+  calendar: Calendar;
 }
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// "No transaction matching …" — shared by the three actions that resolve a
+// single existing transaction from a selector, so the wording can't drift apart.
+function noMatchText(intent: Intent, money: (n: number) => string, fallback: string): string {
+  const what =
+    intent.selectorKind === "amount"
+      ? `matching ${money(intent.amount)}`
+      : intent.selectorKind === "merchant"
+        ? `matching “${esc(intent.selectorValue)}”`
+        : fallback;
+  return `⚠️ No transaction ${what}.`;
+}
+
+// An envelope's display name from its row id, for describing a charge that is
+// leaving one. Ids are unique, so the first match is the only match.
+function labelForId(p: Projection, id: number | null): string | null {
+  if (id === null) return null;
+  for (const cat of p.categories.values()) if (cat.id === id) return cat.label;
+  return null;
+}
+
+// The transaction's date as a LOCAL day. Returns null for a row with no usable
+// date rather than letting Intl throw on an invalid one.
+function localDay(iso: string | undefined, cal: Calendar): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: cal.timeZone,
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
 }
 
 async function buildProjection(env: Env): Promise<Projection> {
@@ -160,17 +229,14 @@ async function buildProjection(env: Env): Promise<Projection> {
     budgetAmount: cfg.budget_amount,
     period: isPeriod(cfg.period) ? cfg.period : "weekly",
     currency: cfg.currency,
+    calendar: calendarFrom(env),
   };
 }
 
 /* ------------------------------------------------------------------- plan */
 
 // Validate one step against the projection and, if valid, advance it.
-async function planStep(
-  env: Env,
-  intent: Intent,
-  p: Projection,
-): Promise<Omit<PlannedStep, "view">> {
+async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPlan> {
   const money = (n: number) => formatMoney(n, p.currency);
 
   switch (intent.action) {
@@ -247,15 +313,7 @@ async function planStep(
       // Exclude rows an earlier step already claimed, so "move the last two
       // charges" doesn't resolve to the same transaction twice.
       const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) {
-        const what =
-          intent.selectorKind === "amount"
-            ? `matching ${money(intent.amount)}`
-            : intent.selectorKind === "merchant"
-              ? `matching “${esc(intent.selectorValue)}”`
-              : "to move";
-        return { ok: false, text: `⚠️ No transaction ${what}.` };
-      }
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to move") };
       p.claimedTxnIds.push(txn.id);
       return {
         ok: true,
@@ -272,21 +330,87 @@ async function planStep(
       }
       const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
       const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
-      if (!txn) {
-        const what =
-          intent.selectorKind === "amount"
-            ? `matching ${money(intent.amount)}`
-            : intent.selectorKind === "merchant"
-              ? `matching “${esc(intent.selectorValue)}”`
-              : "to change";
-        return { ok: false, text: `⚠️ No transaction ${what}.` };
-      }
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to change") };
       p.claimedTxnIds.push(txn.id);
       return {
         ok: true,
         text:
           `Change ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
           `to <b>${money(intent.newAmount)}</b>`,
+      };
+    }
+
+    case "remove_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to remove") };
+      p.claimedTxnIds.push(txn.id);
+      const who = txn.merchant ?? "unknown";
+      const day = localDay(txn.occurred_at, p.calendar);
+      return {
+        ok: true,
+        text: `Remove ${money(txn.amount)} — ${esc(who)}`,
+        // "Most recent charge" doesn't say WHICH charge that is, so a
+        // selector-only confirmation asks for a blind approval. Name the row
+        // the selector actually landed on instead. move_transaction and
+        // set_transaction_amount have the same blind spot and can use this
+        // too; removal goes first because it takes the whole row at once.
+        resolved: [["Removing", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`]],
+      };
+    }
+
+    case "unfile_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to move") };
+      // Claimed either way, so "move the last two charges back" walks two rows
+      // rather than reporting on the same one twice.
+      p.claimedTxnIds.push(txn.id);
+      if (txn.category_id === null) {
+        return {
+          ok: true,
+          // Not an error: the charge is already where the user wants it, and
+          // failing the step would block every other step in the batch.
+          text: `Leave ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} on the main budget (already there)`,
+          resolved: [["Already there", "This charge is on the main budget"]],
+        };
+      }
+      const who = txn.merchant ?? "unknown";
+      const day = localDay(txn.occurred_at, p.calendar);
+      const from = labelForId(p, txn.category_id);
+      return {
+        ok: true,
+        text: `Return ${money(txn.amount)} — ${esc(who)} to the main budget`,
+        resolved: [
+          ["Returning", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`],
+          ...(from ? ([["Out of", from]] as [string, string][]) : []),
+        ],
+      };
+    }
+
+    case "delete_category": {
+      if (!intent.category) return { ok: false, text: "⚠️ No budget name given." };
+      const cat = p.categories.get(intent.category);
+      if (!cat) return { ok: false, text: `⚠️ No budget called <b>${esc(intent.category)}</b>.` };
+      // A category created earlier in this batch has no rows yet, so there is
+      // nothing to count and nothing to warn about.
+      const filed = cat.id === null ? { n: 0, total: 0 } : await categoryTotals(env, cat.id);
+      p.categories.delete(intent.category);
+      const fate = intent.purgeTransactions
+        ? `${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) deleted with it`
+        : `${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) return to the main budget`;
+      return {
+        ok: true,
+        text: `Delete <b>${esc(cat.label)}</b> — ${filed.n ? fate : "no charges filed to it"}`,
+        // Spelled out because the two dispositions differ by whether real
+        // spending survives, and the flag that decides it came from a parse.
+        resolved: filed.n ? [["Affects", fate]] : [["Affects", "No charges filed to it"]],
       };
     }
 
@@ -297,6 +421,8 @@ async function planStep(
       return { ok: true, text: "Answer a spending question" };
     case "list_transactions":
       return { ok: true, text: "List transactions" };
+    case "report":
+      return { ok: true, text: "Show a report" };
 
     default:
       return { ok: false, text: `⚠️ ${intent.reason || "I didn't follow that part."}` };
@@ -307,8 +433,12 @@ export async function planBatch(env: Env, intents: Intent[]): Promise<PlannedSte
   const projection = await buildProjection(env);
   const steps: PlannedStep[] = [];
   for (const intent of intents) {
-    const step = await planStep(env, intent, projection);
-    steps.push({ ...step, view: describeIntent(intent, projection.currency) });
+    const { resolved, ...step } = await planStep(env, intent, projection);
+    const view = describeIntent(intent, projection.currency);
+    steps.push({
+      ...step,
+      view: resolved?.length ? { ...view, fields: [...view.fields, ...resolved] } : view,
+    });
   }
   return steps;
 }
@@ -405,6 +535,52 @@ async function applyStep(
           `Changed ${esc(txn.merchant ?? "unknown")} from ${money(txn.amount)} ` +
           `to <b>${money(intent.newAmount)}</b>`,
       };
+    }
+
+    case "remove_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "That removal is no longer valid" };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      if (!txn) return { ok: false, text: "That transaction is no longer there" };
+      claimed.push(txn.id);
+      await deleteTransaction(env, txn.id);
+      return {
+        ok: true,
+        text: `Removed ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")}`,
+      };
+    }
+
+    case "unfile_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "That move is no longer valid" };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      if (!txn) return { ok: false, text: "That transaction is no longer there" };
+      claimed.push(txn.id);
+      if (txn.category_id === null) {
+        return { ok: true, text: `${esc(txn.merchant ?? "unknown")} was already on the main budget` };
+      }
+      await setTxnCategory(env, txn.id, null);
+      return {
+        ok: true,
+        text: `Returned ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} to the main budget`,
+      };
+    }
+
+    case "delete_category": {
+      const cat = await findCategory(env, intent.category);
+      if (!cat) return { ok: false, text: `<b>${esc(intent.category)}</b> no longer exists` };
+      const filed = await categoryTotals(env, cat.id);
+      await deleteCategory(env, cat.id, intent.purgeTransactions);
+      const tail = !filed.n
+        ? ""
+        : intent.purgeTransactions
+          ? ` — ${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) deleted with it`
+          : ` — ${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) returned to the main budget`;
+      return { ok: true, text: `Deleted <b>${esc(cat.label)}</b>${tail}` };
     }
 
     default:

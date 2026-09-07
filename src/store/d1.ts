@@ -206,6 +206,92 @@ export async function upsertCategory(
     .run();
 }
 
+// Aggregates for a report over the half-open range [since, until). Grouping in
+// SQL rather than summing rows in the Worker keeps a yearly report one small
+// result set instead of every transaction of the year.
+export interface CategoryTotal {
+  category_id: number | null; // null = the main budget
+  n: number;
+  total: number;
+}
+
+export async function totalsByCategory(
+  env: Env,
+  sinceIso: string,
+  untilIso: string,
+): Promise<CategoryTotal[]> {
+  const res = await env.DB.prepare(
+    `SELECT category_id, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM transactions WHERE occurred_at >= ? AND occurred_at < ?
+      GROUP BY category_id`,
+  )
+    .bind(sinceIso, untilIso)
+    .all<CategoryTotal>();
+  return res.results ?? [];
+}
+
+export interface MerchantTotal {
+  merchant: string | null;
+  n: number;
+  total: number;
+}
+
+// Biggest merchants in the range, across every envelope. Merchants are grouped
+// by their stored text, so two spellings of one shop count separately — the
+// alternative is fuzzy matching, which would silently merge distinct payees.
+export async function topMerchants(
+  env: Env,
+  sinceIso: string,
+  untilIso: string,
+  limit = 5,
+): Promise<MerchantTotal[]> {
+  const res = await env.DB.prepare(
+    `SELECT merchant, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM transactions WHERE occurred_at >= ? AND occurred_at < ?
+      GROUP BY merchant ORDER BY total DESC LIMIT ?`,
+  )
+    .bind(sinceIso, untilIso, Math.max(1, Math.min(20, limit)))
+    .all<MerchantTotal>();
+  return res.results ?? [];
+}
+
+// How much is filed to one envelope, over all time. Used to tell the user what
+// a deletion is about to take with it.
+export async function categoryTotals(
+  env: Env,
+  categoryId: number,
+): Promise<{ n: number; total: number }> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM transactions WHERE category_id = ?`,
+  )
+    .bind(categoryId)
+    .first<{ n: number; total: number }>();
+  return { n: row?.n ?? 0, total: row?.total ?? 0 };
+}
+
+// Delete an envelope. `purge` decides what happens to the charges filed to it:
+// false returns them to the main budget (the spending survives, and starts
+// counting against the main budget again), true deletes them outright.
+//
+// Both statements go through batch(), which D1 runs as a single transaction.
+// Run separately, a failure in between leaves the charges already moved or
+// deleted while the envelope is still there — a half-applied deletion the user
+// was never shown and cannot tell apart from a no-op. Charges are still dealt
+// with first, so the ordering is right even on a backend without transactions.
+export async function deleteCategory(env: Env, id: number, purge: boolean): Promise<void> {
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        purge
+          ? `DELETE FROM transactions WHERE category_id = ?`
+          : `UPDATE transactions SET category_id = NULL WHERE category_id = ?`,
+      )
+      .bind(id),
+    env.DB.prepare(`DELETE FROM categories WHERE id = ?`).bind(id),
+  ]);
+}
+
 export async function setCategoryBudget(env: Env, id: number, amount: number): Promise<void> {
   await env.DB.prepare(`UPDATE categories SET amount = ? WHERE id = ?`).bind(amount, id).run();
 }
@@ -293,6 +379,17 @@ export async function setTxnAmount(env: Env, txnId: number, amount: number): Pro
   await env.DB.prepare(`UPDATE transactions SET amount = ? WHERE id = ?`)
     .bind(amount, txnId)
     .run();
+}
+
+// Delete a transaction outright. Totals are summed live and nothing else
+// references the row, so it simply goes — no soft-delete flag that every other
+// query would then have to remember to filter on.
+//
+// The dedupe hash goes with it, so a bank re-delivering the same alert would
+// capture it again. That is the right reading of "remove this": the user is
+// saying the record is wrong, not asking to suppress that alert forever.
+export async function deleteTransaction(env: Env, txnId: number): Promise<void> {
+  await env.DB.prepare(`DELETE FROM transactions WHERE id = ?`).bind(txnId).run();
 }
 
 export async function setTxnCategory(

@@ -8,6 +8,8 @@ against a budget, and:
 - 📊 Posts a **weekly summary** on a schedule
 - 💬 Answers **on-demand checks** — message `/status` in the group to see what's left
 - 🗂 Tracks **budget envelopes** — a yearly gift budget separate from your weekly spend
+- 📈 Reports a whole **week, month, quarter or year** — on demand, and posted
+  automatically when a quarter or a year closes
 - 🗣 Understands **plain English** — `@bot move the last $200 charge into yearly gift budget`
 
 No bank credentials, no Plaid, nothing to poll. Bank alert → email → Worker.
@@ -36,7 +38,8 @@ different chat platform later means swapping an adapter, not a rewrite.
 |---|---|
 | `src/core/parser.ts` | Turns an alert email into `{ amount, merchant, currency }` or `null` |
 | `src/core/engine.ts` | Budget status + which threshold alerts to fire |
-| `src/core/period.ts` | Monthly/weekly period boundaries |
+| `src/core/period.ts` | Week/month/quarter/year period boundaries, in a real timezone |
+| `src/core/schedule.ts` | Which job a cron firing is asking for |
 | `src/service.ts` | Ties core → storage → Telegram (the shared pipeline) |
 | `src/store/d1.ts` | D1 data layer (the only DB-specific module) |
 | `src/notify/telegram.ts` | Delivery channel |
@@ -44,9 +47,10 @@ different chat platform later means swapping an adapter, not a rewrite.
 | `src/telegram/commands.ts` | Slash commands, @mention routing, confirmation taps |
 | `src/nl/schema.ts` | Intent JSON schema + normalization |
 | `src/nl/interpret.ts` | Claude API call — classification only, never touches D1 |
-| `src/nl/execute.ts` | Intent → typed handlers, confirm-then-apply |
+| `src/nl/execute.ts` | Reads (status, history, reports) + staging writes for confirmation |
+| `src/nl/plan.ts` | Dry-run validation of a batch, then applying the approved plan |
 | `src/router.ts` | HTTP routes: `/telegram`, `/inbound`, health |
-| `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` |
+| `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` (digest + period reports) |
 
 ## Natural language
 
@@ -58,6 +62,10 @@ mean:
 @budgetbot move the last $200 charge into yearly gift budget
 @budgetbot create a yearly gift budget of 1200
 @budgetbot change the last charge to $48.60
+@budgetbot delete the last charge
+@budgetbot move the last charge back to my main budget
+@budgetbot delete the gift budget
+@budgetbot how did last quarter go?
 @budgetbot how much did I spend on gifts this year?
 @budgetbot set my weekly budget to 400
 ```
@@ -95,6 +103,25 @@ Correcting an amount (`change the last charge to $48.60`) is for when the captur
 figure is wrong — bank alerts frequently land pre-tip. Budget totals are summed
 live, so every status recomputes on the next read.
 
+Removing one (`delete the last charge`, `remove the $12 coffee`) is for a record
+that shouldn't exist at all — a charge that was never yours, or the same spend
+captured twice. Nothing restores the row afterwards, so the confirmation names
+the row the selector actually landed on rather than just repeating the selector
+back:
+
+```
+Confirm this?
+
+Remove transaction
+Which charge  Most recent charge
+Removing      $200.00 — TOP GOLF BAY RESERVA (07-22)
+                          [✅ Yes]  [✖️ No]
+```
+
+The row is deleted outright, dedupe hash and all — so if the bank re-sends that
+same alert it will be captured again. "Remove" means the record was wrong, not
+"never accept this alert".
+
 Anything that changes data shows a summary with **Yes / No** buttons and only
 applies on tap, so a misread amount can't silently move money.
 
@@ -115,6 +142,101 @@ work exactly as before.
 
 ## Budget envelopes
 
+Envelopes are **exclusive**: a transaction counts toward exactly one budget.
+Moving a $200 charge into `gift` removes it from your weekly budget, so weekly
+remaining goes *up* by $200. Uncategorized spend is the default budget.
+
+Threshold alerts fire on the default envelope only — a yearly gift budget
+shouldn't trip a weekly warning. `/categories` lists envelopes and their spend.
+
+Charges move both ways. *"move the last $200 charge into yearly gift budget"*
+files one into an envelope; *"move the last charge back to my main budget"*
+takes it back out, and the confirmation names the envelope it's leaving so you
+can see it landed on the right charge.
+
+Deleting an envelope (*"delete the gift budget"*) **keeps the spending** — its
+charges return to the main budget, where they start counting against your weekly
+total again, and the confirmation tells you how many and how much before you
+tap. Destroying the charges as well takes an explicit ask:
+
+```
+@budgetbot delete the gift budget and everything in it
+```
+
+That distinction is the point. A misparse of *"delete the gift budget"* costs you
+an envelope you can recreate; it can't cost you months of transaction history.
+
+## Reports
+
+`/report` gives an aggregated summary of one whole calendar period — the main
+budget's progress, every envelope, and the biggest merchants — rather than a
+list of rows:
+
+```
+/report            → this month
+/report quarter    → this quarter
+/report year last  → last year
+/report month 2    → two months back
+```
+
+```
+📊 Q3 2026 so far
+
+Main budget
+██████░░░░ 60%
+Spent: $300.00 of $500.00 across 2 transactions
+Remaining: $200.00
+
+Envelopes
+• Gift: $50.00 across 1 transaction
+
+Biggest merchants
+• $300.00 — COSTCO (2×)
+• $50.00 — GIFT SHOP
+
+Everything together: $350.00 across 3 transactions
+```
+
+In natural language, *"how did last quarter go?"* or *"give me a yearly report"*
+does the same.
+
+### Reports that arrive on their own
+
+Two of them are also posted to the group on a schedule, alongside the weekly
+digest:
+
+| Cron | When | What arrives |
+|---|---|---|
+| `0 16 * * SUN` | Sunday ~9am Pacific | Weekly digest |
+| `0 17 1 1,4,7,10 *` | Jan/Apr/Jul/Oct 1st | Report on the quarter that just ended |
+| `0 18 1 1 *` | Jan 1st | Report on the year that just ended |
+
+Each fires on the **first day of the new period and reports the previous one** —
+a quarterly report sent on Oct 1 covers Q3, not the six hours of Q4 that exist
+by then. Jan 1 matches both report crons, so their hours are staggered an hour
+apart rather than racing.
+
+`src/core/schedule.ts` decides which report a firing wants from the *shape* of
+the cron expression, not its exact text, so shifting an hour doesn't silently
+turn a yearly report back into a weekly digest. Delete a line from
+`[triggers] crons` to turn one off; `0 17 1 * *` would add a monthly one.
+
+A period with no spending at all sends nothing — a quiet quarter shouldn't post
+"Nothing recorded" to the group. Asking directly still answers.
+
+Scheduled reports involve no model call, so they work without
+`ANTHROPIC_API_KEY`.
+
+The budget line only appears when the report covers the same cadence your budget
+resets on. `$300.00 of $500.00` is a fact about a week and nonsense about a
+quarter — thirteen weekly budgets aren't one quarterly limit — so a mismatched
+report shows the total and says why there's nothing to compare it against. The
+same rule governs each envelope's limit.
+
+**A report is not `/history`.** `/history` prints every transaction, which is
+right for a week and unusable for a year in a chat message. Ask for a report when
+you want the shape of a period, and a history when you want the rows.
+
 ## Spending history
 
 `/history` lists this week's spending against the main budget; `/history last`
@@ -133,13 +255,6 @@ Total: $125.00 across 2 transactions
 exclusive, money filed into a named envelope isn't weekly spending — a $166.67
 water heater charged to the gift budget stays out of the weekly total. Ask for
 `everything` to see both together, or name an envelope to see just that one.
-
-Envelopes are **exclusive**: a transaction counts toward exactly one budget.
-Moving a $200 charge into `gift` removes it from your weekly budget, so weekly
-remaining goes *up* by $200. Uncategorized spend is the default budget.
-
-Threshold alerts fire on the default envelope only — a yearly gift budget
-shouldn't trip a weekly warning. `/categories` lists envelopes and their spend.
 
 ## Setup
 
@@ -200,6 +315,7 @@ Then add the bot to your group and send:
 /setgroup        → registers the group for alerts & the weekly summary
 /budget 500      → sets your budget
 /status          → shows what's left
+/report quarter  → summarizes the quarter so far
 ```
 
 ### 6. Route your bank alerts to the Worker
@@ -223,7 +339,7 @@ inbox).
 | `WARN_PCT` | `80` | First alert at this % of budget |
 | `ALERT_PCT` | `100` | Second alert at this % of budget |
 | `CURRENCY` | `USD` | Default currency when an alert omits one |
-| `BUDGET_PERIOD` | `weekly` | `weekly`, `monthly`, or `yearly` budget window |
+| `BUDGET_PERIOD` | `weekly` | `weekly`, `monthly`, `quarterly`, or `yearly` budget window |
 | `TIMEZONE` | `America/Los_Angeles` | IANA zone all budget periods are computed in |
 | `WEEK_START` | `sunday` | `sunday` or `monday` — which day a budget week begins |
 | `TELEGRAM_BOT_USERNAME` | — | Your bot's handle, for @mention detection |
@@ -234,8 +350,9 @@ extraction on a latency-sensitive webhook path, and compiled grammars are cached
 only ~24h from last use — a low-traffic personal bot would often pay Opus
 compile latency for no accuracy gain. Switch it if you disagree.
 
-Weekly-summary schedule lives in `[triggers] crons` (default: Sunday 16:00 UTC —
-9am Pacific in summer, 8am in winter, since cron is always UTC).
+Schedules live in `[triggers] crons` — the weekly digest plus the quarterly and
+yearly reports. See [Reports that arrive on their own](#reports-that-arrive-on-their-own).
+Cron is always UTC, so the local hour shifts by one across daylight saving.
 
 ### Weeks and timezones
 

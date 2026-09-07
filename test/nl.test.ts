@@ -10,7 +10,7 @@ import {
   unknownIntent,
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
-import { executeBatch } from "../src/nl/execute";
+import { executeBatch, applyApproved, scheduledReportText } from "../src/nl/execute";
 import { periodStart, periodStartAt, periodEnd, periodLabel, daysAgo, isPeriod, type Calendar } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
@@ -294,13 +294,16 @@ describe("isMutating", () => {
     for (const a of [
       "move_transaction",
       "set_transaction_amount",
+      "remove_transaction",
+      "unfile_transaction",
       "set_budget",
       "create_category",
+      "delete_category",
       "set_period",
     ] as const) {
       expect(isMutating(a)).toBe(true);
     }
-    for (const a of ["get_status", "query_spend", "list_transactions", "unknown"] as const) {
+    for (const a of ["get_status", "query_spend", "list_transactions", "report", "unknown"] as const) {
       expect(isMutating(a)).toBe(false);
     }
   });
@@ -315,8 +318,15 @@ describe("isMutating", () => {
 // Minimal D1 stub: dispatches on the SQL text so planBatch/executeBatch can run
 // offline. Exercises the real projection logic, which is the point of batching.
 function fakeEnv(opts: {
+  config?: Record<string, unknown>;
   categories?: { id: number; name: string; label: string; amount: number; period: string }[];
-  transactions?: { id: number; amount: number; merchant: string | null }[];
+  transactions?: {
+    id: number;
+    amount: number;
+    merchant: string | null;
+    occurred_at?: string;
+    category_id?: number | null;
+  }[];
 }): any {
   const cats = opts.categories ?? [];
   const txns = opts.transactions ?? []; // newest first
@@ -327,9 +337,17 @@ function fakeEnv(opts: {
     warn_pct: 80,
     alert_pct: 100,
     group_chat_id: "1",
+    ...(opts.config ?? {}), // caller overrides win
   };
 
-  const DB = {
+  const writes: { sql: string; binds: any[] }[] = [];
+  const DB: any = {
+    // D1 runs a batch as one transaction; the stub records the same statements
+    // so a test can tell a batched write from two loose ones.
+    async batch(stmts: any[]) {
+      for (const st of stmts) writes.push({ sql: st.__sql, binds: st.__binds, batched: true } as any);
+      return stmts.map(() => ({ meta: { changes: 1 } }));
+    },
     prepare(sql: string) {
       let binds: any[] = [];
       const api: any = {
@@ -339,6 +357,10 @@ function fakeEnv(opts: {
         },
         async first() {
           if (sql.includes("FROM config")) return cfg;
+          if (sql.includes("COUNT(*) AS n") && sql.includes("category_id = ?")) {
+            const filed = txns.filter((t) => (t as any).category_id === binds[0]);
+            return { n: filed.length, total: filed.reduce((sum, t) => sum + t.amount, 0) };
+          }
           if (sql.includes("FROM categories")) {
             return cats.find((c) => c.name === binds[0]) ?? null;
           }
@@ -358,22 +380,49 @@ function fakeEnv(opts: {
           return null;
         },
         async all() {
-          return { results: sql.includes("FROM categories") ? cats : [] };
+          if (sql.includes("FROM categories")) return { results: cats };
+          if (sql.includes("GROUP BY category_id")) {
+            const byCat = new Map<number | null, { category_id: number | null; n: number; total: number }>();
+            for (const t of txns) {
+              const key = (t as any).category_id ?? null;
+              const row = byCat.get(key) ?? { category_id: key, n: 0, total: 0 };
+              row.n += 1;
+              row.total += t.amount;
+              byCat.set(key, row);
+            }
+            return { results: [...byCat.values()] };
+          }
+          if (sql.includes("GROUP BY merchant")) {
+            const byMerchant = new Map<string | null, { merchant: string | null; n: number; total: number }>();
+            for (const t of txns) {
+              const row = byMerchant.get(t.merchant) ?? { merchant: t.merchant, n: 0, total: 0 };
+              row.n += 1;
+              row.total += t.amount;
+              byMerchant.set(t.merchant, row);
+            }
+            return { results: [...byMerchant.values()].sort((a, b) => b.total - a.total) };
+          }
+          return { results: [] };
         },
         async run() {
+          writes.push({ sql, binds });
           return { meta: { changes: 1 } };
         },
       };
+      Object.defineProperty(api, "__sql", { get: () => sql });
+      Object.defineProperty(api, "__binds", { get: () => binds });
       return api;
     },
   };
-  return { DB };
+  return { DB, writes };
 }
 
 describe("planBatch projection", () => {
   const txns = [
-    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA" },
-    { id: 8, amount: 84, merchant: "STARBUCKS" },
+    // 04:00Z on the 23rd is 21:00 on the 22nd in US Pacific — the confirmation
+    // must show the local day, as the history listing does.
+    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA", occurred_at: "2026-07-23T04:00:00.000Z" },
+    { id: 8, amount: 84, merchant: "STARBUCKS", occurred_at: "2026-07-21T17:30:00.000Z" },
   ];
 
   // The case that motivates the whole feature: step 2 must validate against a
@@ -558,6 +607,7 @@ describe("describeIntent", () => {
     expect(view({ action: "add_transaction", amount: 1 }).title).toBe("Add transaction");
     expect(view({ action: "set_transaction_amount" }).title).toBe("Correct amount");
     expect(view({ action: "create_category" }).title).toBe("New budget envelope");
+    expect(view({ action: "remove_transaction" }).title).toBe("Remove transaction");
   });
 
   it("describes a manual transaction field by field", () => {
@@ -605,6 +655,526 @@ describe("describeIntent", () => {
   it("distinguishes a category budget from the main one", () => {
     expect(asMap({ action: "set_budget", amount: 400 }).Budget).toBe("Main budget");
     expect(asMap({ action: "set_budget", amount: 400, category: "gift" }).Budget).toBe("gift");
+  });
+});
+
+/* ---------------------------------------------------------------- removal */
+
+// Deleting is the only action with nothing to undo it, so it gets its own
+// coverage: that it resolves like the other selector actions, and that the
+// confirmation names the row it landed on rather than just the selector.
+describe("remove_transaction", () => {
+  // Typed rather than inferred so a fixture may omit the date, which is the
+  // "still resolves a row that has no usable date" case below.
+  type Fixture = { id: number; amount: number; merchant: string | null; occurred_at?: string };
+  const txns: Fixture[] = [
+    { id: 9, amount: 200, merchant: "TOP GOLF BAY RESERVA", occurred_at: "2026-07-23T04:00:00.000Z" },
+    { id: 8, amount: 84, merchant: "STARBUCKS", occurred_at: "2026-07-21T17:30:00.000Z" },
+  ];
+  const plan = (raw: any, transactions: Fixture[] = txns) =>
+    planBatch(fakeEnv({ transactions }), normalizeBatch({ actions: [raw] }));
+
+  it("counts as a write, so it can never be answered without a tap", () => {
+    expect(isMutating("remove_transaction")).toBe(true);
+    expect(batchMutates(normalizeBatch({ actions: [{ action: "remove_transaction" }] }))).toBe(true);
+  });
+
+  it("plans a removal against the most recent charge", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "last" });
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("Remove $200.00");
+    expect(step.text).toContain("TOP GOLF BAY RESERVA");
+  });
+
+  it("picks a charge by amount", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "amount", amount: 84 });
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("STARBUCKS");
+  });
+
+  it("picks a charge by merchant", async () => {
+    const [step] = await plan({
+      action: "remove_transaction",
+      selector_kind: "merchant",
+      selector_value: "starbucks",
+    });
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("$84.00");
+  });
+
+  // The point of the whole feature's safety story: "Most recent charge" does not
+  // say WHICH charge, and there is no undo, so the plan resolves it for the user.
+  it("names the row the selector landed on, with its local date", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "last" });
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Which charge"]).toBe("Most recent charge");
+    expect(fields["Removing"]).toBe("$200.00 — TOP GOLF BAY RESERVA (07-22)");
+  });
+
+  it("still resolves a row that has no usable date", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "last" }, [
+      { id: 1, amount: 5, merchant: "CASH" },
+    ]);
+    expect(step.ok).toBe(true);
+    expect(Object.fromEntries(step.view.fields)["Removing"]).toBe("$5.00 — CASH");
+  });
+
+  it("refuses when it can't tell which charge was meant", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "none" });
+    expect(step.ok).toBe(false);
+    expect(step.text).toContain("Couldn't tell which charge");
+  });
+
+  it("reports a selector that matches nothing", async () => {
+    const [step] = await plan({ action: "remove_transaction", selector_kind: "amount", amount: 999 });
+    expect(step.ok).toBe(false);
+    expect(step.text).toContain("No transaction matching $999.00");
+  });
+
+  // Same claim tracking as the other selector actions: without it both steps
+  // resolve to the newest row and one deletion silently targets it twice.
+  it("does not resolve two removals to the same transaction", async () => {
+    const steps = await planBatch(
+      fakeEnv({ transactions: txns }),
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "remove_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("TOP GOLF BAY RESERVA");
+    expect(steps[1].text).toContain("STARBUCKS");
+  });
+
+  it("keeps a removal and a move on separate rows", async () => {
+    const steps = await planBatch(
+      fakeEnv({
+        categories: [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }],
+        transactions: txns,
+      }),
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, true]);
+    expect(steps[0].text).toContain("TOP GOLF BAY RESERVA");
+    expect(steps[1].text).toContain("STARBUCKS");
+  });
+
+  it("stages behind a confirmation instead of acting", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: txns }),
+      normalizeBatch({ actions: [{ action: "remove_transaction", selector_kind: "last" }] }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("Confirm this?");
+    expect(reply.text).toContain("<b>Remove transaction</b>");
+    expect(reply.text).toContain("TOP GOLF BAY RESERVA (07-22)");
+  });
+
+  // A merchant name is user-supplied text and reaches the confirmation twice —
+  // once via the selector, once via the resolved row. Both must be escaped.
+  it("escapes a merchant name in the resolved field", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: [{ id: 1, amount: 9, merchant: "A & B <b>", occurred_at: "2026-07-22T19:00:00.000Z" }] }),
+      normalizeBatch({ actions: [{ action: "remove_transaction", selector_kind: "last" }] }),
+    );
+    expect(reply.text).toContain("A &amp; B &lt;b&gt;");
+    expect(reply.text).not.toContain("A & B <b>");
+  });
+});
+
+/* ------------------------------------------------- quarters and reporting */
+
+describe("quarterly periods", () => {
+  const cal: Calendar = { timeZone: "America/Los_Angeles", weekStartsOn: 0 };
+  const at = (offset: number, now: string) =>
+    periodStartAt("quarterly", offset, new Date(now), cal);
+
+  it("is a recognized period", () => {
+    expect(isPeriod("quarterly")).toBe(true);
+  });
+
+  it("snaps to the quarter the date sits in", () => {
+    // Every month of Q3 resolves to the same July 1 boundary.
+    for (const d of ["2026-07-01T12:00:00Z", "2026-08-14T12:00:00Z", "2026-09-30T12:00:00Z"]) {
+      expect(at(0, d).toISOString()).toBe(new Date("2026-07-01T07:00:00Z").toISOString());
+    }
+  });
+
+  it("puts each quarter's first day in its own quarter", () => {
+    expect(periodLabel("quarterly", at(0, "2026-01-01T12:00:00Z"), cal)).toBe("Q1 2026");
+    expect(periodLabel("quarterly", at(0, "2026-04-01T12:00:00Z"), cal)).toBe("Q2 2026");
+    expect(periodLabel("quarterly", at(0, "2026-07-01T12:00:00Z"), cal)).toBe("Q3 2026");
+    expect(periodLabel("quarterly", at(0, "2026-10-01T12:00:00Z"), cal)).toBe("Q4 2026");
+  });
+
+  it("walks back quarters across a year boundary", () => {
+    const now = "2026-02-10T12:00:00Z"; // Q1 2026
+    expect(periodLabel("quarterly", at(1, now), cal)).toBe("Q4 2025");
+    expect(periodLabel("quarterly", at(2, now), cal)).toBe("Q3 2025");
+    expect(periodLabel("quarterly", at(4, now), cal)).toBe("Q1 2025");
+  });
+
+  it("ends exactly where the next quarter begins", () => {
+    const start = at(0, "2026-08-14T12:00:00Z");
+    expect(periodEnd("quarterly", start, cal).toISOString()).toBe(
+      at(0, "2026-10-05T12:00:00Z").toISOString(),
+    );
+  });
+
+  it("lands on local midnight, not UTC midnight", () => {
+    // Q4 begins Oct 1 at 00:00 Pacific = 07:00 UTC (PDT is still in effect).
+    expect(at(0, "2026-11-05T12:00:00Z").toISOString()).toBe("2026-10-01T07:00:00.000Z");
+  });
+
+  // A Q3 boundary is a DST-free stretch, but Q1/Q4 straddle both changes.
+  it("keeps whole quarters adjacent across daylight saving", () => {
+    const q1 = at(0, "2026-02-10T12:00:00Z");
+    expect(periodEnd("quarterly", q1, cal).toISOString()).toBe(
+      at(0, "2026-05-10T12:00:00Z").toISOString(),
+    );
+  });
+});
+
+describe("report", () => {
+  const txns = [
+    { id: 3, amount: 200, merchant: "COSTCO", category_id: null, occurred_at: "2026-07-05T19:00:00.000Z" },
+    { id: 2, amount: 100, merchant: "COSTCO", category_id: null, occurred_at: "2026-07-06T19:00:00.000Z" },
+    { id: 1, amount: 50, merchant: "GIFT SHOP", category_id: 1, occurred_at: "2026-07-07T19:00:00.000Z" },
+  ];
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const run = (raw: any, config?: Record<string, unknown>) =>
+    executeBatch(
+      fakeEnv({ transactions: txns, categories: cats, config }),
+      normalizeBatch({ actions: [{ action: "report", ...raw }] }),
+    );
+
+  it("is a read — answered outright, never staged for a tap", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.confirmToken).toBeUndefined();
+  });
+
+  it("separates main-budget spend from envelope spend", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.text).toContain("$300.00"); // main only
+    expect(reply.text).toContain("Gift");
+    expect(reply.text).toContain("$350.00"); // everything together
+  });
+
+  it("groups repeat merchants and ranks them", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.text).toContain("$300.00 — COSTCO (2×)");
+    expect(reply.text.indexOf("COSTCO")).toBeLessThan(reply.text.indexOf("GIFT SHOP"));
+  });
+
+  // "$300 of $500" is true for a week and nonsense for a quarter on a weekly
+  // budget, so the limit is only shown when the cadences actually match.
+  it("compares against the budget only when the cadences match", async () => {
+    const weekly = await run({ window: "week" }, { period: "weekly" });
+    expect(weekly.text).toContain("of $500.00");
+
+    const quarterly = await run({ window: "quarter" }, { period: "weekly" });
+    expect(quarterly.text).not.toContain("of $500.00");
+    expect(quarterly.text).toContain("budget resets weekly");
+  });
+
+  it("labels the period it covers", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.text).toMatch(/Q[1-4] \d{4}/);
+  });
+
+  // The cron path must not post "Nothing recorded" to the group every quarter,
+  // but someone who typed /report still deserves an answer.
+  it("stays silent for the cron on an empty period, but answers a direct ask", async () => {
+    const quiet = fakeEnv({ transactions: [] });
+    expect(await scheduledReportText(quiet, "quarter", 1)).toBeNull();
+
+    const asked = await executeBatch(
+      quiet,
+      normalizeBatch({ actions: [{ action: "report", window: "quarter", period_offset: 1 }] }),
+    );
+    expect(asked.text).toContain("Nothing recorded");
+  });
+
+  it("returns the same report the command does when there is spending", async () => {
+    const env = fakeEnv({ transactions: txns, categories: cats });
+    const scheduled = await scheduledReportText(env, "quarter", 0);
+    const asked = await executeBatch(
+      env,
+      normalizeBatch({ actions: [{ action: "report", window: "quarter", period_offset: 0 }] }),
+    );
+    expect(scheduled).toBe(asked.text);
+  });
+
+  it("says so plainly when a period is empty", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: [] }),
+      normalizeBatch({ actions: [{ action: "report", window: "year" }] }),
+    );
+    expect(reply.text).toContain("Nothing recorded");
+  });
+});
+
+/* ------------------------------------------------ unfiling and envelope rm */
+
+describe("unfile_transaction", () => {
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const filed = [
+    { id: 9, amount: 200, merchant: "TOP GOLF", category_id: 1, occurred_at: "2026-07-23T04:00:00.000Z" },
+  ];
+
+  it("returns a filed charge to the main budget, naming the envelope it leaves", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ categories: cats, transactions: filed }),
+      normalizeBatch({ actions: [{ action: "unfile_transaction", selector_kind: "last" }] }),
+    );
+    expect(step.ok).toBe(true);
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Move into"]).toBe("Main budget");
+    expect(fields["Returning"]).toBe("$200.00 — TOP GOLF (07-22)");
+    expect(fields["Out of"]).toBe("Gift");
+  });
+
+  // Not a failure: erroring here would block every other step in the batch.
+  it("treats an already-unfiled charge as a no-op, not an error", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ transactions: [{ id: 9, amount: 200, merchant: "TOP GOLF", category_id: null }] }),
+      normalizeBatch({ actions: [{ action: "unfile_transaction", selector_kind: "last" }] }),
+    );
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("already there");
+  });
+
+  it("refuses without a selector", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ transactions: filed }),
+      normalizeBatch({ actions: [{ action: "unfile_transaction", selector_kind: "none" }] }),
+    );
+    expect(step.ok).toBe(false);
+  });
+
+  // A no-op step still claims its row, or "move the last two back" reports on
+  // the same charge twice and silently leaves the second one filed.
+  it("walks two rows when asked twice, even where the first is a no-op", async () => {
+    const steps = await planBatch(
+      fakeEnv({
+        categories: cats,
+        transactions: [
+          { id: 9, amount: 200, merchant: "ALREADY MAIN", category_id: null },
+          { id: 8, amount: 50, merchant: "IN GIFT", category_id: 1 },
+        ],
+      }),
+      normalizeBatch({
+        actions: [
+          { action: "unfile_transaction", selector_kind: "last" },
+          { action: "unfile_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps[0].text).toContain("already there");
+    expect(steps[1].text).toContain("IN GIFT");
+  });
+});
+
+describe("delete_category", () => {
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const filed = [
+    { id: 9, amount: 200, merchant: "TOP GOLF", category_id: 1 },
+    { id: 8, amount: 50, merchant: "GIFT SHOP", category_id: 1 },
+  ];
+  const plan = (raw: any, transactions = filed) =>
+    planBatch(
+      fakeEnv({ categories: cats, transactions }),
+      normalizeBatch({ actions: [{ action: "delete_category", category: "gift", ...raw }] }),
+    );
+
+  // The whole point of the flag: a plain deletion must never destroy spending.
+  it("keeps the spending by default, returning it to the main budget", async () => {
+    const [step] = await plan({});
+    expect(step.ok).toBe(true);
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Its charges"]).toBe("Return to main budget");
+    expect(fields["Affects"]).toBe("2 charges ($250.00) return to the main budget");
+  });
+
+  it("destroys the spending only when the flag is explicitly set", async () => {
+    const [step] = await plan({ purge_transactions: true });
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Its charges"]).toBe("Deleted too");
+    expect(fields["Affects"]).toBe("2 charges ($250.00) deleted with it");
+  });
+
+  it("never reads a missing or junk flag as consent to destroy", () => {
+    for (const raw of [undefined, null, "", 0, "yes", "TRUE-ish", {}]) {
+      expect(normalizeIntent({ action: "delete_category", purge_transactions: raw }).purgeTransactions).toBe(false);
+    }
+    expect(normalizeIntent({ action: "delete_category", purge_transactions: true }).purgeTransactions).toBe(true);
+    // pending_actions round trips through JSON, which can stringify the flag.
+    expect(normalizeIntent({ action: "delete_category", purgeTransactions: "true" }).purgeTransactions).toBe(true);
+  });
+
+  it("says plainly when there is nothing filed to it", async () => {
+    const [step] = await plan({}, []);
+    expect(Object.fromEntries(step.view.fields)["Affects"]).toBe("No charges filed to it");
+  });
+
+  it("rejects an envelope that doesn't exist", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ categories: cats }),
+      normalizeBatch({ actions: [{ action: "delete_category", category: "nope" }] }),
+    );
+    expect(step.ok).toBe(false);
+    expect(step.text).toContain("No budget called");
+  });
+
+  // The projection must show the envelope gone, or a later step plans against
+  // a world that will not exist by the time it runs.
+  it("blocks a move into an envelope an earlier step deletes", async () => {
+    const steps = await planBatch(
+      fakeEnv({ categories: cats, transactions: filed }),
+      normalizeBatch({
+        actions: [
+          { action: "delete_category", category: "gift" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, false]);
+    expect(steps[1].text).toContain("No budget called");
+  });
+
+  it("stages behind a confirmation stating the consequence", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ categories: cats, transactions: filed }),
+      normalizeBatch({ actions: [{ action: "delete_category", category: "gift" }] }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("<b>Delete budget envelope</b>");
+    expect(reply.text).toContain("return to the main budget");
+  });
+});
+
+/* ------------------------------------------------------------ apply paths */
+
+// Everything above stops at the confirmation. These run the code that fires
+// AFTER the tap — the statements that actually destroy or move data — because a
+// plan that reads correctly and a write that does the right thing are two
+// different claims, and only the second one costs you transaction history.
+describe("applying an approved batch", () => {
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const filed = [
+    { id: 9, amount: 200, merchant: "TOP GOLF", category_id: 1 },
+    { id: 8, amount: 50, merchant: "GIFT SHOP", category_id: 1 },
+  ];
+  const apply = async (raw: any, opts: any = {}) => {
+    const env = fakeEnv({ categories: cats, transactions: filed, ...opts });
+    const text = await applyApproved(env, normalizeBatch({ actions: [raw] }));
+    return { text, writes: (env as any).writes as { sql: string; binds: any[] }[] };
+  };
+  // Generic so the caller keeps `binds` on the rows it gets back.
+  const statements = <T extends { sql: string }>(writes: T[], needle: string) =>
+    writes.filter((w) => w.sql.includes(needle));
+
+  it("removing a charge deletes exactly that row", async () => {
+    const { text, writes } = await apply({ action: "remove_transaction", selector_kind: "last" });
+    const dels = statements(writes, "DELETE FROM transactions");
+    expect(dels).toHaveLength(1);
+    expect(dels[0].binds).toEqual([9]); // the newest, not the other one
+    expect(text).toContain("Removed $200.00");
+  });
+
+  it("unfiling clears the category instead of deleting anything", async () => {
+    const { text, writes } = await apply({ action: "unfile_transaction", selector_kind: "last" });
+    expect(statements(writes, "DELETE FROM transactions")).toHaveLength(0);
+    const upd = statements(writes, "SET category_id = ?");
+    expect(upd).toHaveLength(1);
+    expect(upd[0].binds).toEqual([null, 9]);
+    expect(text).toContain("Returned");
+  });
+
+  // The flag's whole job. If this ever inverts, a plain "delete the gift budget"
+  // silently destroys real spending records.
+  it("deleting an envelope keeps its charges by default", async () => {
+    const { text, writes } = await apply({ action: "delete_category", category: "gift" });
+    expect(statements(writes, "DELETE FROM transactions")).toHaveLength(0);
+    expect(statements(writes, "UPDATE transactions SET category_id = NULL")).toHaveLength(1);
+    expect(statements(writes, "DELETE FROM categories")).toHaveLength(1);
+    expect(text).toContain("returned to the main budget");
+  });
+
+  it("deleting an envelope destroys its charges only with the flag", async () => {
+    const { text, writes } = await apply({
+      action: "delete_category",
+      category: "gift",
+      purge_transactions: true,
+    });
+    expect(statements(writes, "UPDATE transactions SET category_id = NULL")).toHaveLength(0);
+    expect(statements(writes, "DELETE FROM transactions")).toHaveLength(1);
+    expect(statements(writes, "DELETE FROM categories")).toHaveLength(1);
+    expect(text).toContain("deleted with it");
+  });
+
+  // Half-applied deletion is the failure that matters here: charges already
+  // moved or destroyed while the envelope is still listed.
+  it("deletes the envelope and settles its charges in one transaction", async () => {
+    const { writes } = await apply({ action: "delete_category", category: "gift" });
+    const parts = writes.filter(
+      (w) => w.sql.includes("DELETE FROM categories") || w.sql.includes("category_id = NULL"),
+    );
+    expect(parts).toHaveLength(2);
+    expect(parts.every((w) => (w as any).batched)).toBe(true);
+  });
+
+  it("correcting an amount writes the new figure, not the identifying one", async () => {
+    const { writes } = await apply({
+      action: "set_transaction_amount",
+      selector_kind: "amount",
+      amount: 200,
+      new_amount: 48.6,
+    });
+    const upd = statements(writes, "SET amount = ?");
+    expect(upd[0].binds).toEqual([48.6, 9]);
+  });
+
+  it("does not re-target one row for two steps", async () => {
+    const env = fakeEnv({ categories: cats, transactions: filed });
+    await applyApproved(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "remove_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    const dels = ((env as any).writes as { sql: string; binds: any[] }[]).filter((w) =>
+      w.sql.includes("DELETE FROM transactions"),
+    );
+    expect(dels.map((d) => d.binds[0])).toEqual([9, 8]);
+  });
+
+  // A step whose target vanished between the tap and the write must not take
+  // the rest of the batch down with it.
+  it("reports a step whose row is gone and still runs the others", async () => {
+    const env = fakeEnv({ categories: cats, transactions: [] });
+    const text = await applyApproved(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "set_budget", amount: 400 },
+        ],
+      }),
+    );
+    expect(text).toContain("no longer there");
+    expect(text).toContain("Main budget set to $400.00");
+    expect(text).toContain("didn't apply");
   });
 });
 
