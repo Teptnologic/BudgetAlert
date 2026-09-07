@@ -353,6 +353,14 @@ function fakeEnv(opts: {
       const needle = String(binds[0]).replace(/%/g, "").toLowerCase();
       pool = pool.filter((t) => (t.merchant ?? "").toLowerCase().includes(needle));
     }
+    // listRecent() scopes in SQL. Mirrored here so a test can actually catch a
+    // listing that filters after the LIMIT instead of before it.
+    if (sql.includes("WHERE category_id = ?")) {
+      pool = pool.filter((t) => (t as any).category_id === binds[0]);
+    }
+    if (sql.includes("WHERE category_id IS NULL")) {
+      pool = pool.filter((t) => ((t as any).category_id ?? null) === null);
+    }
     return pool;
   };
 
@@ -376,6 +384,13 @@ function fakeEnv(opts: {
           if (sql.includes("COUNT(*) AS n") && sql.includes("category_id = ?")) {
             const filed = txns.filter((t) => (t as any).category_id === binds[0]);
             return { n: filed.length, total: filed.reduce((sum, t) => sum + t.amount, 0) };
+          }
+          // sumScope() over main / all — an unbounded total, no date range.
+          if (sql.includes("COUNT(*) AS n") && sql.includes("FROM transactions")) {
+            const pool = sql.includes("category_id IS NULL")
+              ? txns.filter((t) => ((t as any).category_id ?? null) === null)
+              : txns;
+            return { n: pool.length, total: pool.reduce((sum, t) => sum + t.amount, 0) };
           }
           if (sql.includes("FROM categories")) {
             return cats.find((c) => c.name === binds[0]) ?? null;
@@ -854,6 +869,102 @@ describe("quarterly periods", () => {
     expect(periodEnd("quarterly", q1, cal).toISOString()).toBe(
       at(0, "2026-05-10T12:00:00Z").toISOString(),
     );
+  });
+});
+
+// "@bot show all of my gift spending" — an envelope named, no date range. It
+// used to come back empty or as unrelated spending; these pin down why.
+describe("all-time envelope history", () => {
+  // A gift envelope with real history, none of it recent: every gift charge is
+  // older than the main budget's newest rows. This is the shape that broke.
+  const txns = [
+    { id: 6, amount: 40, merchant: "SAFEWAY", category_id: null, occurred_at: "2026-09-05T19:00:00.000Z" },
+    { id: 5, amount: 30, merchant: "SAFEWAY", category_id: null, occurred_at: "2026-09-04T19:00:00.000Z" },
+    { id: 4, amount: 20, merchant: "SAFEWAY", category_id: null, occurred_at: "2026-09-03T19:00:00.000Z" },
+    { id: 3, amount: 10, merchant: "SAFEWAY", category_id: null, occurred_at: "2026-09-02T19:00:00.000Z" },
+    { id: 2, amount: 300, merchant: "GIFT SHOP", category_id: 1, occurred_at: "2026-02-10T19:00:00.000Z" },
+    { id: 1, amount: 150, merchant: "TOY STORE", category_id: 1, occurred_at: "2026-01-05T19:00:00.000Z" },
+  ];
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const run = (raw: any) =>
+    executeBatch(
+      fakeEnv({ transactions: txns, categories: cats }),
+      normalizeBatch({ actions: [{ action: "list_transactions", ...raw }] }),
+    );
+
+  it("lists an envelope's whole history, not one calendar period", async () => {
+    const reply = await run({ scope: "category", category: "gift", window: "all" });
+    expect(reply.text).toContain("GIFT SHOP");
+    expect(reply.text).toContain("TOY STORE");
+    expect(reply.text).toContain("all time");
+    expect(reply.text).toContain("$450.00");
+  });
+
+  it("keeps unrelated spending out of an envelope's history", async () => {
+    const reply = await run({ scope: "category", category: "gift", window: "all" });
+    expect(reply.text).not.toContain("SAFEWAY");
+  });
+
+  // The regression: the recent-N listing fetched the newest 50 rows across the
+  // whole account and filtered to the envelope afterwards, so an envelope whose
+  // charges all fall outside that window reported "Nothing recorded" despite
+  // having history. It takes more than 50 rows to reproduce — the filter has to
+  // be pushed past the cap, not merely applied in the wrong order.
+  it("finds envelope charges older than the newest 50 rows overall", async () => {
+    const buried = [
+      ...Array.from({ length: 60 }, (_, i) => ({
+        id: 1000 + i,
+        amount: 10,
+        merchant: "SAFEWAY",
+        category_id: null,
+        occurred_at: `2026-09-${String(60 - i).padStart(2, "0")}T19:00:00.000Z`.replace(
+          /-(\d\d)T/,
+          (_m, d) => `-${String(Math.max(1, Math.min(30, Number(d)))).padStart(2, "0")}T`,
+        ),
+      })),
+      { id: 2, amount: 300, merchant: "GIFT SHOP", category_id: 1, occurred_at: "2026-02-10T19:00:00.000Z" },
+      { id: 1, amount: 150, merchant: "TOY STORE", category_id: 1, occurred_at: "2026-01-05T19:00:00.000Z" },
+    ];
+    const reply = await executeBatch(
+      fakeEnv({ transactions: buried, categories: cats }),
+      normalizeBatch({
+        actions: [
+          { action: "list_transactions", scope: "category", category: "gift", window: "none", limit: 5 },
+        ],
+      }),
+    );
+    expect(reply.text).not.toContain("Nothing recorded");
+    expect(reply.text).toContain("GIFT SHOP");
+    expect(reply.text).toContain("TOY STORE");
+  });
+
+  it("still scopes a plain recent listing to the main budget", async () => {
+    const reply = await run({ window: "none", limit: 5 });
+    expect(reply.text).toContain("SAFEWAY");
+    expect(reply.text).not.toContain("GIFT SHOP");
+  });
+
+  it("answers an all-time spend question over the whole history", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: txns, categories: cats }),
+      normalizeBatch({
+        actions: [{ action: "query_spend", category: "gift", scope: "category", window: "all" }],
+      }),
+    );
+    expect(reply.text).toContain("All time");
+    expect(reply.text).toContain("$450.00");
+  });
+
+  // A report is by construction one period's summary, so 'all' has no meaning
+  // there. It must not silently degrade to a week.
+  it("reads an all-time report as the year rather than a week", () => {
+    const i = normalizeBatch({ actions: [{ action: "report", window: "all" }] })[0];
+    expect(i.window).toBe("year");
+  });
+
+  it("leaves 'all' alone on a listing", () => {
+    const i = normalizeBatch({ actions: [{ action: "list_transactions", window: "all" }] })[0];
+    expect(i.window).toBe("all");
   });
 });
 

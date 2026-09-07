@@ -367,6 +367,7 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "<i>@bot delete the gift budget</i>\n" +
           "<i>@bot how did last quarter go?</i>\n" +
           "<i>@bot show my spending last week</i>\n" +
+          "<i>@bot show all of my gift spending</i>\n" +
           "<i>@bot how much did I spend on gifts this year?</i>",
       );
       return;

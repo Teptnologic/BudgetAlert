@@ -24,9 +24,11 @@ import {
   getConfig,
   listCategories,
   findCategory,
-  recentTransactions,
   listBetween,
+  listRecent,
+  sumScope,
   sumSince,
+  MAX_ROWS,
   totalsByCategory,
   topMerchants,
   type TxnScope,
@@ -100,8 +102,8 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// A report/listing window as a budget period. 'none' has no calendar meaning,
-// so callers that can receive it decide what to do before calling this.
+// A report/listing window as a budget period. 'none' and 'all' have no calendar
+// meaning, so callers that can receive them decide what to do before calling this.
 function windowPeriod(window: Intent["window"]): Period {
   if (window === "year") return "yearly";
   if (window === "quarter") return "quarterly";
@@ -132,6 +134,26 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
     }
 
     case "query_spend": {
+      const cat = intent.category ? await findCategory(env, intent.category) : null;
+      if (intent.category && !cat) {
+        return `I don't have a budget called <b>${esc(intent.category)}</b> yet.`;
+      }
+      const scope = cat ? esc(cat.label) : "your main budget";
+
+      // All-time is its own query, not a very large day count: "how much have I
+      // ever spent on gifts" has no start date, and answering it with a rolling
+      // window would quietly drop everything older than that window.
+      if (intent.window === "all") {
+        const { n, total } = await sumScope(
+          env,
+          cat ? { kind: "category", id: cat.id } : { kind: "main" },
+        );
+        return (
+          `All time on ${scope}: <b>${formatMoney(total, cfg.currency)}</b> ` +
+          `across ${n} transaction${n === 1 ? "" : "s"}`
+        );
+      }
+
       const days =
         intent.window === "year"
           ? 365
@@ -141,12 +163,7 @@ async function readReply(env: Env, intent: Intent): Promise<string> {
               ? 30
               : 7;
       const since = daysAgo(days, new Date(), cal).toISOString();
-      const cat = intent.category ? await findCategory(env, intent.category) : null;
-      if (intent.category && !cat) {
-        return `I don't have a budget called <b>${esc(intent.category)}</b> yet.`;
-      }
       const spent = await sumSince(env, since, cat ? cat.id : null);
-      const scope = cat ? esc(cat.label) : "your main budget";
       return `Last ${days} days on ${scope}: <b>${formatMoney(spent, cfg.currency)}</b>`;
     }
 
@@ -184,20 +201,23 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
 
   let rows: FullTxnRow[];
   let heading: string;
+  // Set when the listing was capped, so the total can still speak for the whole
+  // history rather than for the rows that happened to fit.
+  let capped: { n: number; total: number } | null = null;
 
-  if (intent.window === "none") {
+  if (intent.window === "all") {
+    // Everything, ever. The rows are capped to what a chat message can hold,
+    // but the count and total below come from the unbounded query.
+    const totals = await sumScope(env, scope);
+    rows = (await listRecent(env, scope, MAX_ROWS)).reverse();
+    if (totals.n > rows.length) capped = totals;
+    heading = `${esc(scopeLabel)} — all time`;
+  } else if (intent.window === "none") {
     const limit = intent.limit || 5;
-    const all = await recentTransactions(env, 50);
-    rows = all
-      .filter((r) =>
-        scope.kind === "all"
-          ? true
-          : scope.kind === "main"
-            ? r.category_id === null
-            : r.category_id === scope.id,
-      )
-      .slice(0, limit)
-      .reverse(); // oldest first, so it reads as a chronology
+    // Filtered in SQL. Taking the newest 50 overall and filtering afterwards
+    // showed "Nothing recorded" for an envelope whose charges were simply older
+    // than the account's 50 most recent.
+    rows = (await listRecent(env, scope, limit)).reverse(); // oldest first, so it reads as a chronology
     heading = `Last ${rows.length} on ${esc(scopeLabel)}`;
   } else {
     const period = windowPeriod(intent.window);
@@ -215,7 +235,7 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
 
   if (!rows.length) return `<b>${heading}</b>\nNothing recorded.`;
 
-  const total = rows.reduce((sum, r) => sum + r.amount, 0);
+  const total = capped ? capped.total : rows.reduce((sum, r) => sum + r.amount, 0);
   // Dates are stored as UTC instants but must READ as local days, or a Saturday
   // evening in California prints as Sunday and contradicts the week it's in.
   const dayFmt = new Intl.DateTimeFormat("en-CA", {
@@ -230,10 +250,16 @@ async function listTransactions(env: Env, intent: Intent, currency: string): Pro
     return `${day}  ${formatMoney(r.amount, currency)} — ${esc(r.merchant ?? "unknown")}${tag}`;
   });
 
+  const shown = capped
+    ? `\n<i>Showing the ${rows.length} most recent.</i>`
+    : "";
+  const count = capped ? capped.n : rows.length;
+
   return (
     `<b>${heading}</b>\n` +
     `<code>${lines.join("\n")}</code>\n` +
-    `<b>Total: ${formatMoney(total, currency)}</b> across ${rows.length} transaction${rows.length === 1 ? "" : "s"}`
+    `<b>Total: ${formatMoney(total, currency)}</b> across ${count} transaction${count === 1 ? "" : "s"}` +
+    shown
   );
 }
 
