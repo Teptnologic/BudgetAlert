@@ -10,7 +10,7 @@ import {
   unknownIntent,
 } from "../src/nl/schema";
 import { planBatch, describeIntent } from "../src/nl/plan";
-import { executeBatch, scheduledReportText } from "../src/nl/execute";
+import { executeBatch, applyApproved, scheduledReportText } from "../src/nl/execute";
 import { periodStart, periodStartAt, periodEnd, periodLabel, daysAgo, isPeriod, type Calendar } from "../src/core/period";
 
 // The API caps a request at 24 optional parameters and 16 parameters using
@@ -340,7 +340,14 @@ function fakeEnv(opts: {
     ...(opts.config ?? {}), // caller overrides win
   };
 
-  const DB = {
+  const writes: { sql: string; binds: any[] }[] = [];
+  const DB: any = {
+    // D1 runs a batch as one transaction; the stub records the same statements
+    // so a test can tell a batched write from two loose ones.
+    async batch(stmts: any[]) {
+      for (const st of stmts) writes.push({ sql: st.__sql, binds: st.__binds, batched: true } as any);
+      return stmts.map(() => ({ meta: { changes: 1 } }));
+    },
     prepare(sql: string) {
       let binds: any[] = [];
       const api: any = {
@@ -398,13 +405,16 @@ function fakeEnv(opts: {
           return { results: [] };
         },
         async run() {
+          writes.push({ sql, binds });
           return { meta: { changes: 1 } };
         },
       };
+      Object.defineProperty(api, "__sql", { get: () => sql });
+      Object.defineProperty(api, "__binds", { get: () => binds });
       return api;
     },
   };
-  return { DB };
+  return { DB, writes };
 }
 
 describe("planBatch projection", () => {
@@ -1047,6 +1057,124 @@ describe("delete_category", () => {
     expect(reply.confirmToken).toBeTruthy();
     expect(reply.text).toContain("<b>Delete budget envelope</b>");
     expect(reply.text).toContain("return to the main budget");
+  });
+});
+
+/* ------------------------------------------------------------ apply paths */
+
+// Everything above stops at the confirmation. These run the code that fires
+// AFTER the tap — the statements that actually destroy or move data — because a
+// plan that reads correctly and a write that does the right thing are two
+// different claims, and only the second one costs you transaction history.
+describe("applying an approved batch", () => {
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const filed = [
+    { id: 9, amount: 200, merchant: "TOP GOLF", category_id: 1 },
+    { id: 8, amount: 50, merchant: "GIFT SHOP", category_id: 1 },
+  ];
+  const apply = async (raw: any, opts: any = {}) => {
+    const env = fakeEnv({ categories: cats, transactions: filed, ...opts });
+    const text = await applyApproved(env, normalizeBatch({ actions: [raw] }));
+    return { text, writes: (env as any).writes as { sql: string; binds: any[] }[] };
+  };
+  // Generic so the caller keeps `binds` on the rows it gets back.
+  const statements = <T extends { sql: string }>(writes: T[], needle: string) =>
+    writes.filter((w) => w.sql.includes(needle));
+
+  it("removing a charge deletes exactly that row", async () => {
+    const { text, writes } = await apply({ action: "remove_transaction", selector_kind: "last" });
+    const dels = statements(writes, "DELETE FROM transactions");
+    expect(dels).toHaveLength(1);
+    expect(dels[0].binds).toEqual([9]); // the newest, not the other one
+    expect(text).toContain("Removed $200.00");
+  });
+
+  it("unfiling clears the category instead of deleting anything", async () => {
+    const { text, writes } = await apply({ action: "unfile_transaction", selector_kind: "last" });
+    expect(statements(writes, "DELETE FROM transactions")).toHaveLength(0);
+    const upd = statements(writes, "SET category_id = ?");
+    expect(upd).toHaveLength(1);
+    expect(upd[0].binds).toEqual([null, 9]);
+    expect(text).toContain("Returned");
+  });
+
+  // The flag's whole job. If this ever inverts, a plain "delete the gift budget"
+  // silently destroys real spending records.
+  it("deleting an envelope keeps its charges by default", async () => {
+    const { text, writes } = await apply({ action: "delete_category", category: "gift" });
+    expect(statements(writes, "DELETE FROM transactions")).toHaveLength(0);
+    expect(statements(writes, "UPDATE transactions SET category_id = NULL")).toHaveLength(1);
+    expect(statements(writes, "DELETE FROM categories")).toHaveLength(1);
+    expect(text).toContain("returned to the main budget");
+  });
+
+  it("deleting an envelope destroys its charges only with the flag", async () => {
+    const { text, writes } = await apply({
+      action: "delete_category",
+      category: "gift",
+      purge_transactions: true,
+    });
+    expect(statements(writes, "UPDATE transactions SET category_id = NULL")).toHaveLength(0);
+    expect(statements(writes, "DELETE FROM transactions")).toHaveLength(1);
+    expect(statements(writes, "DELETE FROM categories")).toHaveLength(1);
+    expect(text).toContain("deleted with it");
+  });
+
+  // Half-applied deletion is the failure that matters here: charges already
+  // moved or destroyed while the envelope is still listed.
+  it("deletes the envelope and settles its charges in one transaction", async () => {
+    const { writes } = await apply({ action: "delete_category", category: "gift" });
+    const parts = writes.filter(
+      (w) => w.sql.includes("DELETE FROM categories") || w.sql.includes("category_id = NULL"),
+    );
+    expect(parts).toHaveLength(2);
+    expect(parts.every((w) => (w as any).batched)).toBe(true);
+  });
+
+  it("correcting an amount writes the new figure, not the identifying one", async () => {
+    const { writes } = await apply({
+      action: "set_transaction_amount",
+      selector_kind: "amount",
+      amount: 200,
+      new_amount: 48.6,
+    });
+    const upd = statements(writes, "SET amount = ?");
+    expect(upd[0].binds).toEqual([48.6, 9]);
+  });
+
+  it("does not re-target one row for two steps", async () => {
+    const env = fakeEnv({ categories: cats, transactions: filed });
+    await applyApproved(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "remove_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    const dels = ((env as any).writes as { sql: string; binds: any[] }[]).filter((w) =>
+      w.sql.includes("DELETE FROM transactions"),
+    );
+    expect(dels.map((d) => d.binds[0])).toEqual([9, 8]);
+  });
+
+  // A step whose target vanished between the tap and the write must not take
+  // the rest of the batch down with it.
+  it("reports a step whose row is gone and still runs the others", async () => {
+    const env = fakeEnv({ categories: cats, transactions: [] });
+    const text = await applyApproved(
+      env,
+      normalizeBatch({
+        actions: [
+          { action: "remove_transaction", selector_kind: "last" },
+          { action: "set_budget", amount: 400 },
+        ],
+      }),
+    );
+    expect(text).toContain("no longer there");
+    expect(text).toContain("Main budget set to $400.00");
+    expect(text).toContain("didn't apply");
   });
 });
 

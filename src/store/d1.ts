@@ -274,17 +274,22 @@ export async function categoryTotals(
 // false returns them to the main budget (the spending survives, and starts
 // counting against the main budget again), true deletes them outright.
 //
-// Charges are dealt with FIRST either way, so a failure between the two
-// statements can never leave rows pointing at an envelope that is gone.
+// Both statements go through batch(), which D1 runs as a single transaction.
+// Run separately, a failure in between leaves the charges already moved or
+// deleted while the envelope is still there — a half-applied deletion the user
+// was never shown and cannot tell apart from a no-op. Charges are still dealt
+// with first, so the ordering is right even on a backend without transactions.
 export async function deleteCategory(env: Env, id: number, purge: boolean): Promise<void> {
-  await env.DB.prepare(
-    purge
-      ? `DELETE FROM transactions WHERE category_id = ?`
-      : `UPDATE transactions SET category_id = NULL WHERE category_id = ?`,
-  )
-    .bind(id)
-    .run();
-  await env.DB.prepare(`DELETE FROM categories WHERE id = ?`).bind(id).run();
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        purge
+          ? `DELETE FROM transactions WHERE category_id = ?`
+          : `UPDATE transactions SET category_id = NULL WHERE category_id = ?`,
+      )
+      .bind(id),
+    env.DB.prepare(`DELETE FROM categories WHERE id = ?`).bind(id),
+  ]);
 }
 
 export async function setCategoryBudget(env: Env, id: number, amount: number): Promise<void> {
