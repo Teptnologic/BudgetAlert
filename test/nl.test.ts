@@ -295,13 +295,15 @@ describe("isMutating", () => {
       "move_transaction",
       "set_transaction_amount",
       "remove_transaction",
+      "unfile_transaction",
       "set_budget",
       "create_category",
+      "delete_category",
       "set_period",
     ] as const) {
       expect(isMutating(a)).toBe(true);
     }
-    for (const a of ["get_status", "query_spend", "list_transactions", "unknown"] as const) {
+    for (const a of ["get_status", "query_spend", "list_transactions", "report", "unknown"] as const) {
       expect(isMutating(a)).toBe(false);
     }
   });
@@ -316,12 +318,14 @@ describe("isMutating", () => {
 // Minimal D1 stub: dispatches on the SQL text so planBatch/executeBatch can run
 // offline. Exercises the real projection logic, which is the point of batching.
 function fakeEnv(opts: {
+  config?: Record<string, unknown>;
   categories?: { id: number; name: string; label: string; amount: number; period: string }[];
   transactions?: {
     id: number;
     amount: number;
     merchant: string | null;
     occurred_at?: string;
+    category_id?: number | null;
   }[];
 }): any {
   const cats = opts.categories ?? [];
@@ -333,6 +337,7 @@ function fakeEnv(opts: {
     warn_pct: 80,
     alert_pct: 100,
     group_chat_id: "1",
+    ...(opts.config ?? {}), // caller overrides win
   };
 
   const DB = {
@@ -345,6 +350,10 @@ function fakeEnv(opts: {
         },
         async first() {
           if (sql.includes("FROM config")) return cfg;
+          if (sql.includes("COUNT(*) AS n") && sql.includes("category_id = ?")) {
+            const filed = txns.filter((t) => (t as any).category_id === binds[0]);
+            return { n: filed.length, total: filed.reduce((sum, t) => sum + t.amount, 0) };
+          }
           if (sql.includes("FROM categories")) {
             return cats.find((c) => c.name === binds[0]) ?? null;
           }
@@ -364,7 +373,29 @@ function fakeEnv(opts: {
           return null;
         },
         async all() {
-          return { results: sql.includes("FROM categories") ? cats : [] };
+          if (sql.includes("FROM categories")) return { results: cats };
+          if (sql.includes("GROUP BY category_id")) {
+            const byCat = new Map<number | null, { category_id: number | null; n: number; total: number }>();
+            for (const t of txns) {
+              const key = (t as any).category_id ?? null;
+              const row = byCat.get(key) ?? { category_id: key, n: 0, total: 0 };
+              row.n += 1;
+              row.total += t.amount;
+              byCat.set(key, row);
+            }
+            return { results: [...byCat.values()] };
+          }
+          if (sql.includes("GROUP BY merchant")) {
+            const byMerchant = new Map<string | null, { merchant: string | null; n: number; total: number }>();
+            for (const t of txns) {
+              const row = byMerchant.get(t.merchant) ?? { merchant: t.merchant, n: 0, total: 0 };
+              row.n += 1;
+              row.total += t.amount;
+              byMerchant.set(t.merchant, row);
+            }
+            return { results: [...byMerchant.values()].sort((a, b) => b.total - a.total) };
+          }
+          return { results: [] };
         },
         async run() {
           return { meta: { changes: 1 } };
@@ -745,6 +776,254 @@ describe("remove_transaction", () => {
     );
     expect(reply.text).toContain("A &amp; B &lt;b&gt;");
     expect(reply.text).not.toContain("A & B <b>");
+  });
+});
+
+/* ------------------------------------------------- quarters and reporting */
+
+describe("quarterly periods", () => {
+  const cal: Calendar = { timeZone: "America/Los_Angeles", weekStartsOn: 0 };
+  const at = (offset: number, now: string) =>
+    periodStartAt("quarterly", offset, new Date(now), cal);
+
+  it("is a recognized period", () => {
+    expect(isPeriod("quarterly")).toBe(true);
+  });
+
+  it("snaps to the quarter the date sits in", () => {
+    // Every month of Q3 resolves to the same July 1 boundary.
+    for (const d of ["2026-07-01T12:00:00Z", "2026-08-14T12:00:00Z", "2026-09-30T12:00:00Z"]) {
+      expect(at(0, d).toISOString()).toBe(new Date("2026-07-01T07:00:00Z").toISOString());
+    }
+  });
+
+  it("puts each quarter's first day in its own quarter", () => {
+    expect(periodLabel("quarterly", at(0, "2026-01-01T12:00:00Z"), cal)).toBe("Q1 2026");
+    expect(periodLabel("quarterly", at(0, "2026-04-01T12:00:00Z"), cal)).toBe("Q2 2026");
+    expect(periodLabel("quarterly", at(0, "2026-07-01T12:00:00Z"), cal)).toBe("Q3 2026");
+    expect(periodLabel("quarterly", at(0, "2026-10-01T12:00:00Z"), cal)).toBe("Q4 2026");
+  });
+
+  it("walks back quarters across a year boundary", () => {
+    const now = "2026-02-10T12:00:00Z"; // Q1 2026
+    expect(periodLabel("quarterly", at(1, now), cal)).toBe("Q4 2025");
+    expect(periodLabel("quarterly", at(2, now), cal)).toBe("Q3 2025");
+    expect(periodLabel("quarterly", at(4, now), cal)).toBe("Q1 2025");
+  });
+
+  it("ends exactly where the next quarter begins", () => {
+    const start = at(0, "2026-08-14T12:00:00Z");
+    expect(periodEnd("quarterly", start, cal).toISOString()).toBe(
+      at(0, "2026-10-05T12:00:00Z").toISOString(),
+    );
+  });
+
+  it("lands on local midnight, not UTC midnight", () => {
+    // Q4 begins Oct 1 at 00:00 Pacific = 07:00 UTC (PDT is still in effect).
+    expect(at(0, "2026-11-05T12:00:00Z").toISOString()).toBe("2026-10-01T07:00:00.000Z");
+  });
+
+  // A Q3 boundary is a DST-free stretch, but Q1/Q4 straddle both changes.
+  it("keeps whole quarters adjacent across daylight saving", () => {
+    const q1 = at(0, "2026-02-10T12:00:00Z");
+    expect(periodEnd("quarterly", q1, cal).toISOString()).toBe(
+      at(0, "2026-05-10T12:00:00Z").toISOString(),
+    );
+  });
+});
+
+describe("report", () => {
+  const txns = [
+    { id: 3, amount: 200, merchant: "COSTCO", category_id: null, occurred_at: "2026-07-05T19:00:00.000Z" },
+    { id: 2, amount: 100, merchant: "COSTCO", category_id: null, occurred_at: "2026-07-06T19:00:00.000Z" },
+    { id: 1, amount: 50, merchant: "GIFT SHOP", category_id: 1, occurred_at: "2026-07-07T19:00:00.000Z" },
+  ];
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const run = (raw: any, config?: Record<string, unknown>) =>
+    executeBatch(
+      fakeEnv({ transactions: txns, categories: cats, config }),
+      normalizeBatch({ actions: [{ action: "report", ...raw }] }),
+    );
+
+  it("is a read — answered outright, never staged for a tap", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.confirmToken).toBeUndefined();
+  });
+
+  it("separates main-budget spend from envelope spend", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.text).toContain("$300.00"); // main only
+    expect(reply.text).toContain("Gift");
+    expect(reply.text).toContain("$350.00"); // everything together
+  });
+
+  it("groups repeat merchants and ranks them", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.text).toContain("$300.00 — COSTCO (2×)");
+    expect(reply.text.indexOf("COSTCO")).toBeLessThan(reply.text.indexOf("GIFT SHOP"));
+  });
+
+  // "$300 of $500" is true for a week and nonsense for a quarter on a weekly
+  // budget, so the limit is only shown when the cadences actually match.
+  it("compares against the budget only when the cadences match", async () => {
+    const weekly = await run({ window: "week" }, { period: "weekly" });
+    expect(weekly.text).toContain("of $500.00");
+
+    const quarterly = await run({ window: "quarter" }, { period: "weekly" });
+    expect(quarterly.text).not.toContain("of $500.00");
+    expect(quarterly.text).toContain("budget resets weekly");
+  });
+
+  it("labels the period it covers", async () => {
+    const reply = await run({ window: "quarter" });
+    expect(reply.text).toMatch(/Q[1-4] \d{4}/);
+  });
+
+  it("says so plainly when a period is empty", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ transactions: [] }),
+      normalizeBatch({ actions: [{ action: "report", window: "year" }] }),
+    );
+    expect(reply.text).toContain("Nothing recorded");
+  });
+});
+
+/* ------------------------------------------------ unfiling and envelope rm */
+
+describe("unfile_transaction", () => {
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const filed = [
+    { id: 9, amount: 200, merchant: "TOP GOLF", category_id: 1, occurred_at: "2026-07-23T04:00:00.000Z" },
+  ];
+
+  it("returns a filed charge to the main budget, naming the envelope it leaves", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ categories: cats, transactions: filed }),
+      normalizeBatch({ actions: [{ action: "unfile_transaction", selector_kind: "last" }] }),
+    );
+    expect(step.ok).toBe(true);
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Move into"]).toBe("Main budget");
+    expect(fields["Returning"]).toBe("$200.00 — TOP GOLF (07-22)");
+    expect(fields["Out of"]).toBe("Gift");
+  });
+
+  // Not a failure: erroring here would block every other step in the batch.
+  it("treats an already-unfiled charge as a no-op, not an error", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ transactions: [{ id: 9, amount: 200, merchant: "TOP GOLF", category_id: null }] }),
+      normalizeBatch({ actions: [{ action: "unfile_transaction", selector_kind: "last" }] }),
+    );
+    expect(step.ok).toBe(true);
+    expect(step.text).toContain("already there");
+  });
+
+  it("refuses without a selector", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ transactions: filed }),
+      normalizeBatch({ actions: [{ action: "unfile_transaction", selector_kind: "none" }] }),
+    );
+    expect(step.ok).toBe(false);
+  });
+
+  // A no-op step still claims its row, or "move the last two back" reports on
+  // the same charge twice and silently leaves the second one filed.
+  it("walks two rows when asked twice, even where the first is a no-op", async () => {
+    const steps = await planBatch(
+      fakeEnv({
+        categories: cats,
+        transactions: [
+          { id: 9, amount: 200, merchant: "ALREADY MAIN", category_id: null },
+          { id: 8, amount: 50, merchant: "IN GIFT", category_id: 1 },
+        ],
+      }),
+      normalizeBatch({
+        actions: [
+          { action: "unfile_transaction", selector_kind: "last" },
+          { action: "unfile_transaction", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps[0].text).toContain("already there");
+    expect(steps[1].text).toContain("IN GIFT");
+  });
+});
+
+describe("delete_category", () => {
+  const cats = [{ id: 1, name: "gift", label: "Gift", amount: 1200, period: "yearly" }];
+  const filed = [
+    { id: 9, amount: 200, merchant: "TOP GOLF", category_id: 1 },
+    { id: 8, amount: 50, merchant: "GIFT SHOP", category_id: 1 },
+  ];
+  const plan = (raw: any, transactions = filed) =>
+    planBatch(
+      fakeEnv({ categories: cats, transactions }),
+      normalizeBatch({ actions: [{ action: "delete_category", category: "gift", ...raw }] }),
+    );
+
+  // The whole point of the flag: a plain deletion must never destroy spending.
+  it("keeps the spending by default, returning it to the main budget", async () => {
+    const [step] = await plan({});
+    expect(step.ok).toBe(true);
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Its charges"]).toBe("Return to main budget");
+    expect(fields["Affects"]).toBe("2 charges ($250.00) return to the main budget");
+  });
+
+  it("destroys the spending only when the flag is explicitly set", async () => {
+    const [step] = await plan({ purge_transactions: true });
+    const fields = Object.fromEntries(step.view.fields);
+    expect(fields["Its charges"]).toBe("Deleted too");
+    expect(fields["Affects"]).toBe("2 charges ($250.00) deleted with it");
+  });
+
+  it("never reads a missing or junk flag as consent to destroy", () => {
+    for (const raw of [undefined, null, "", 0, "yes", "TRUE-ish", {}]) {
+      expect(normalizeIntent({ action: "delete_category", purge_transactions: raw }).purgeTransactions).toBe(false);
+    }
+    expect(normalizeIntent({ action: "delete_category", purge_transactions: true }).purgeTransactions).toBe(true);
+    // pending_actions round trips through JSON, which can stringify the flag.
+    expect(normalizeIntent({ action: "delete_category", purgeTransactions: "true" }).purgeTransactions).toBe(true);
+  });
+
+  it("says plainly when there is nothing filed to it", async () => {
+    const [step] = await plan({}, []);
+    expect(Object.fromEntries(step.view.fields)["Affects"]).toBe("No charges filed to it");
+  });
+
+  it("rejects an envelope that doesn't exist", async () => {
+    const [step] = await planBatch(
+      fakeEnv({ categories: cats }),
+      normalizeBatch({ actions: [{ action: "delete_category", category: "nope" }] }),
+    );
+    expect(step.ok).toBe(false);
+    expect(step.text).toContain("No budget called");
+  });
+
+  // The projection must show the envelope gone, or a later step plans against
+  // a world that will not exist by the time it runs.
+  it("blocks a move into an envelope an earlier step deletes", async () => {
+    const steps = await planBatch(
+      fakeEnv({ categories: cats, transactions: filed }),
+      normalizeBatch({
+        actions: [
+          { action: "delete_category", category: "gift" },
+          { action: "move_transaction", category: "gift", selector_kind: "last" },
+        ],
+      }),
+    );
+    expect(steps.map((s) => s.ok)).toEqual([true, false]);
+    expect(steps[1].text).toContain("No budget called");
+  });
+
+  it("stages behind a confirmation stating the consequence", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ categories: cats, transactions: filed }),
+      normalizeBatch({ actions: [{ action: "delete_category", category: "gift" }] }),
+    );
+    expect(reply.confirmToken).toBeTruthy();
+    expect(reply.text).toContain("<b>Delete budget envelope</b>");
+    expect(reply.text).toContain("return to the main budget");
   });
 });
 

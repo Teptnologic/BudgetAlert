@@ -15,7 +15,7 @@
 // So: irrelevant fields carry sentinels ("" / 0 / "none") instead of being
 // absent or null, and normalizeIntent() below turns that back into a typed
 // discriminated union for the rest of the app. Current counts, keep them low:
-//   required params: 16 (1 wrapper + 15 item)   optional: 0   anyOf/type-array: 0
+//   required params: 17 (1 wrapper + 16 item)   optional: 0   anyOf/type-array: 0
 //
 // Adding an ACTION is cheap under this shape — a new enum value costs no new
 // parameter, so it does not move any of those counts. Adding a FIELD is what
@@ -41,6 +41,7 @@ const ACTION_SCHEMA = {
     "selector_kind",
     "selector_value",
     "limit",
+    "purge_transactions",
     "reason",
   ],
   properties: {
@@ -54,9 +55,12 @@ const ACTION_SCHEMA = {
         "move_transaction",
         "set_transaction_amount",
         "remove_transaction",
+        "unfile_transaction",
         "set_budget",
         "create_category",
+        "delete_category",
         "set_period",
+        "report",
         "unknown",
       ],
       description: "What the user is asking for. Use 'unknown' when unsure — never guess.",
@@ -93,19 +97,19 @@ const ACTION_SCHEMA = {
     },
     period: {
       type: "string",
-      enum: ["weekly", "monthly", "yearly", "none"],
+      enum: ["weekly", "monthly", "quarterly", "yearly", "none"],
       description: "Budget window for set_period/create_category. 'none' when not applicable.",
     },
     window: {
       type: "string",
-      enum: ["week", "month", "year", "none"],
+      enum: ["week", "month", "quarter", "year", "none"],
       description:
-        "Time window for query_spend and list_transactions. For list_transactions, 'week' means one calendar week (Monday to Sunday). Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
+        "Time window for query_spend, list_transactions and report. These are whole calendar periods, not rolling day counts. Use 'none' on list_transactions to mean 'the most recent transactions' regardless of date.",
     },
     period_offset: {
       type: "integer",
       description:
-        "Which window, counting back from the current one: 0 = this week/month/year, 1 = last, 2 = the one before. Use 0 unless the user asks for an earlier one.",
+        "Which window, counting back from the current one: 0 = this week/month/quarter/year, 1 = last, 2 = the one before. Use 0 unless the user asks for an earlier one.",
     },
     scope: {
       type: "string",
@@ -127,6 +131,11 @@ const ACTION_SCHEMA = {
     limit: {
       type: "integer",
       description: "How many rows for list_recent. 0 means use the default.",
+    },
+    purge_transactions: {
+      type: "boolean",
+      description:
+        "For delete_category ONLY: true deletes the envelope's transactions along with it, false keeps them and returns them to the main budget. Set true only when the user plainly asks for the spending to be deleted too ('delete the gift budget and everything in it'). Default false — deleting an envelope should not destroy spending records unless asked.",
     },
     reason: {
       type: "string",
@@ -167,15 +176,18 @@ export type Action =
   | "move_transaction"
   | "set_transaction_amount"
   | "remove_transaction"
+  | "unfile_transaction"
   | "set_budget"
   | "create_category"
+  | "delete_category"
   | "set_period"
+  | "report"
   | "unknown";
 
 export type SelectorKind = "last" | "amount" | "merchant" | "none";
-export type Window = "week" | "month" | "year" | "none";
+export type Window = "week" | "month" | "quarter" | "year" | "none";
 export type Scope = "main" | "category" | "all";
-export type PeriodOrNone = "weekly" | "monthly" | "yearly" | "none";
+export type PeriodOrNone = "weekly" | "monthly" | "quarterly" | "yearly" | "none";
 
 // The normalized, trusted shape the rest of the app works with.
 export interface Intent {
@@ -193,6 +205,7 @@ export interface Intent {
   selectorKind: SelectorKind;
   selectorValue: string;
   limit: number;
+  purgeTransactions: boolean;
   reason: string;
 }
 
@@ -202,8 +215,10 @@ const MUTATING: ReadonlySet<Action> = new Set<Action>([
   "move_transaction",
   "set_transaction_amount",
   "remove_transaction",
+  "unfile_transaction",
   "set_budget",
   "create_category",
+  "delete_category",
   "set_period",
 ]);
 
@@ -228,6 +243,13 @@ function pickEnum<T extends string>(raw: unknown, allowed: Set<string>, fallback
 
 function str(raw: unknown): string {
   return typeof raw === "string" ? raw.trim() : "";
+}
+
+// Only a real `true` (or the string "true", which is how a JSON round trip
+// through pending_actions can render it) counts. Everything else is false.
+function bool(raw: unknown): boolean {
+  if (typeof raw === "boolean") return raw;
+  return typeof raw === "string" && raw.trim().toLowerCase() === "true";
 }
 
 function num(raw: unknown): number {
@@ -273,6 +295,9 @@ export function normalizeIntent(raw: unknown): Intent {
     selectorKind: pickEnum<SelectorKind>(either("selector_kind", "selectorKind"), SELECTORS, "none"),
     selectorValue: str(either("selector_value", "selectorValue")),
     limit: Math.min(20, Math.max(0, Math.trunc(num(o.limit)))),
+    // Destructive, so it takes an explicit true and nothing else: a missing,
+    // null or unparseable value must never read as "yes, delete the spending".
+    purgeTransactions: bool(either("purge_transactions", "purgeTransactions")),
     reason: str(o.reason),
   };
 }

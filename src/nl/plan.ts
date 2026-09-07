@@ -27,6 +27,8 @@ import {
   setTxnCategory,
   setTxnAmount,
   deleteTransaction,
+  deleteCategory,
+  categoryTotals,
   setBudget,
   setPeriod,
 } from "../store/d1";
@@ -62,14 +64,17 @@ const TITLES: Record<string, string> = {
   move_transaction: "Move transaction",
   set_transaction_amount: "Correct amount",
   remove_transaction: "Remove transaction",
+  unfile_transaction: "Return to main budget",
   set_budget: "Set budget",
   create_category: "New budget envelope",
+  delete_category: "Delete budget envelope",
   set_period: "Change budget window",
 };
 
 const PERIOD_WORDS: Record<string, string> = {
   weekly: "Weekly",
   monthly: "Monthly",
+  quarterly: "Quarterly",
   yearly: "Yearly",
 };
 
@@ -113,6 +118,18 @@ export function describeIntent(intent: Intent, currency: string): IntentView {
     // is the only place that can look it up.
     case "remove_transaction":
       add("Which charge", which());
+      break;
+
+    case "unfile_transaction":
+      add("Which charge", which());
+      add("Move into", "Main budget");
+      break;
+
+    case "delete_category":
+      add("Envelope", intent.categoryLabel || intent.category || "—");
+      // The flag is the whole safety story here, so it is stated as a field
+      // rather than left implicit in the summary line.
+      add("Its charges", intent.purgeTransactions ? "Deleted too" : "Return to main budget");
       break;
 
     case "set_budget":
@@ -172,6 +189,14 @@ function noMatchText(intent: Intent, money: (n: number) => string, fallback: str
         ? `matching “${esc(intent.selectorValue)}”`
         : fallback;
   return `⚠️ No transaction ${what}.`;
+}
+
+// An envelope's display name from its row id, for describing a charge that is
+// leaving one. Ids are unique, so the first match is the only match.
+function labelForId(p: Projection, id: number | null): string | null {
+  if (id === null) return null;
+  for (const cat of p.categories.values()) if (cat.id === id) return cat.label;
+  return null;
 }
 
 // The transaction's date as a LOCAL day. Returns null for a row with no usable
@@ -337,6 +362,58 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
       };
     }
 
+    case "unfile_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "⚠️ Couldn't tell which charge you meant." };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, p.claimedTxnIds);
+      if (!txn) return { ok: false, text: noMatchText(intent, money, "to move") };
+      // Claimed either way, so "move the last two charges back" walks two rows
+      // rather than reporting on the same one twice.
+      p.claimedTxnIds.push(txn.id);
+      if (txn.category_id === null) {
+        return {
+          ok: true,
+          // Not an error: the charge is already where the user wants it, and
+          // failing the step would block every other step in the batch.
+          text: `Leave ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} on the main budget (already there)`,
+          resolved: [["Already there", "This charge is on the main budget"]],
+        };
+      }
+      const who = txn.merchant ?? "unknown";
+      const day = localDay(txn.occurred_at, p.calendar);
+      const from = labelForId(p, txn.category_id);
+      return {
+        ok: true,
+        text: `Return ${money(txn.amount)} — ${esc(who)} to the main budget`,
+        resolved: [
+          ["Returning", `${money(txn.amount)} — ${who}${day ? ` (${day})` : ""}`],
+          ...(from ? ([["Out of", from]] as [string, string][]) : []),
+        ],
+      };
+    }
+
+    case "delete_category": {
+      if (!intent.category) return { ok: false, text: "⚠️ No budget name given." };
+      const cat = p.categories.get(intent.category);
+      if (!cat) return { ok: false, text: `⚠️ No budget called <b>${esc(intent.category)}</b>.` };
+      // A category created earlier in this batch has no rows yet, so there is
+      // nothing to count and nothing to warn about.
+      const filed = cat.id === null ? { n: 0, total: 0 } : await categoryTotals(env, cat.id);
+      p.categories.delete(intent.category);
+      const fate = intent.purgeTransactions
+        ? `${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) deleted with it`
+        : `${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) return to the main budget`;
+      return {
+        ok: true,
+        text: `Delete <b>${esc(cat.label)}</b> — ${filed.n ? fate : "no charges filed to it"}`,
+        // Spelled out because the two dispositions differ by whether real
+        // spending survives, and the flag that decides it came from a parse.
+        resolved: filed.n ? [["Affects", fate]] : [["Affects", "No charges filed to it"]],
+      };
+    }
+
     // Reads are always valid; they run after any writes so they see fresh state.
     case "get_status":
       return { ok: true, text: "Show budget status" };
@@ -344,6 +421,8 @@ async function planStep(env: Env, intent: Intent, p: Projection): Promise<StepPl
       return { ok: true, text: "Answer a spending question" };
     case "list_transactions":
       return { ok: true, text: "List transactions" };
+    case "report":
+      return { ok: true, text: "Show a report" };
 
     default:
       return { ok: false, text: `⚠️ ${intent.reason || "I didn't follow that part."}` };
@@ -471,6 +550,37 @@ async function applyStep(
         ok: true,
         text: `Removed ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")}`,
       };
+    }
+
+    case "unfile_transaction": {
+      if (intent.selectorKind === "none") {
+        return { ok: false, text: "That move is no longer valid" };
+      }
+      const value = intent.selectorKind === "amount" ? intent.amount : intent.selectorValue;
+      const txn = await findTransaction(env, intent.selectorKind, value, claimed);
+      if (!txn) return { ok: false, text: "That transaction is no longer there" };
+      claimed.push(txn.id);
+      if (txn.category_id === null) {
+        return { ok: true, text: `${esc(txn.merchant ?? "unknown")} was already on the main budget` };
+      }
+      await setTxnCategory(env, txn.id, null);
+      return {
+        ok: true,
+        text: `Returned ${money(txn.amount)} — ${esc(txn.merchant ?? "unknown")} to the main budget`,
+      };
+    }
+
+    case "delete_category": {
+      const cat = await findCategory(env, intent.category);
+      if (!cat) return { ok: false, text: `<b>${esc(intent.category)}</b> no longer exists` };
+      const filed = await categoryTotals(env, cat.id);
+      await deleteCategory(env, cat.id, intent.purgeTransactions);
+      const tail = !filed.n
+        ? ""
+        : intent.purgeTransactions
+          ? ` — ${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) deleted with it`
+          : ` — ${filed.n} charge${filed.n === 1 ? "" : "s"} (${money(filed.total)}) returned to the main budget`;
+      return { ok: true, text: `Deleted <b>${esc(cat.label)}</b>${tail}` };
     }
 
     default:

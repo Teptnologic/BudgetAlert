@@ -6,7 +6,8 @@
 //
 //   /status  (or "left", "balance")  → remaining budget for the current period
 //   /budget <amount>                 → set the budget amount
-//   /period weekly|monthly|yearly    → set the budget window
+//   /period weekly|…|yearly          → set the budget window
+//   /report [week|…|year] [last|N]   → aggregated summary for a whole period
 //   /categories                      → list budget envelopes
 //   /setgroup                        → register this chat for alerts & summaries
 //   /help                            → command list
@@ -192,14 +193,17 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
         ? "weekly"
         : p.startsWith("month")
           ? "monthly"
-          : p.startsWith("year")
-            ? "yearly"
-            : null;
+          : p.startsWith("quarter") || p === "q"
+            ? "quarterly"
+            : p.startsWith("year")
+              ? "yearly"
+              : null;
       if (!period) {
         await sendMessage(
           env,
           chat,
-          "Usage: <code>/period weekly</code>, <code>monthly</code>, or <code>yearly</code>",
+          "Usage: <code>/period weekly</code>, <code>monthly</code>, " +
+            "<code>quarterly</code>, or <code>yearly</code>",
         );
         return;
       }
@@ -220,6 +224,31 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
             { action: "list_transactions", window: "week", period_offset: offset, scope: "main" },
           ],
         }),
+      );
+      await sendMessage(env, chat, reply.text);
+      return;
+    }
+
+    // Aggregated summary for a whole calendar period. Same deterministic path
+    // as /history — the common case costs no model call:
+    //   /report  ·  /report quarter  ·  /report year last  ·  /report month 2
+    case "/report": {
+      const parts = arg.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      let window: "week" | "month" | "quarter" | "year" = "month";
+      let offset = 0;
+      for (const part of parts) {
+        if (part.startsWith("week")) window = "week";
+        else if (part.startsWith("month")) window = "month";
+        else if (part.startsWith("quarter") || part === "q") window = "quarter";
+        else if (part.startsWith("year")) window = "year";
+        else if (part.startsWith("last") || part.startsWith("prev")) offset = 1;
+        else if (Number.isFinite(Number.parseInt(part, 10))) {
+          offset = Number.parseInt(part, 10);
+        }
+      }
+      const reply = await executeBatch(
+        env,
+        normalizeBatch({ actions: [{ action: "report", window, period_offset: offset }] }),
       );
       await sendMessage(env, chat, reply.text);
       return;
@@ -266,7 +295,8 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
         "<b>BudgetAlert</b>\n" +
           "/status — how much budget is left\n" +
           "/budget &lt;amount&gt; — set your main budget\n" +
-          "/period weekly|monthly|yearly — set the budget window\n" +
+          "/period weekly|monthly|quarterly|yearly — set the budget window\n" +
+          "/report [week|month|quarter|year] [last|N] — period summary\n" +
           "/history [last|N] — this week's spending, or N weeks back\n" +
           "/categories — list budget envelopes\n" +
           "/setgroup — send alerts &amp; summaries here\n" +
@@ -277,6 +307,9 @@ async function handleCommand(env: Env, chat: string, text: string): Promise<void
           "<i>@bot create a yearly gift budget of 1200</i>\n" +
           "<i>@bot change the last charge to $48.60</i>\n" +
           "<i>@bot delete the last charge</i>\n" +
+          "<i>@bot move the last charge back to my main budget</i>\n" +
+          "<i>@bot delete the gift budget</i>\n" +
+          "<i>@bot how did last quarter go?</i>\n" +
           "<i>@bot show my spending last week</i>\n" +
           "<i>@bot how much did I spend on gifts this year?</i>",
       );

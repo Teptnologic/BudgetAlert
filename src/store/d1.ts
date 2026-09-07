@@ -206,6 +206,87 @@ export async function upsertCategory(
     .run();
 }
 
+// Aggregates for a report over the half-open range [since, until). Grouping in
+// SQL rather than summing rows in the Worker keeps a yearly report one small
+// result set instead of every transaction of the year.
+export interface CategoryTotal {
+  category_id: number | null; // null = the main budget
+  n: number;
+  total: number;
+}
+
+export async function totalsByCategory(
+  env: Env,
+  sinceIso: string,
+  untilIso: string,
+): Promise<CategoryTotal[]> {
+  const res = await env.DB.prepare(
+    `SELECT category_id, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM transactions WHERE occurred_at >= ? AND occurred_at < ?
+      GROUP BY category_id`,
+  )
+    .bind(sinceIso, untilIso)
+    .all<CategoryTotal>();
+  return res.results ?? [];
+}
+
+export interface MerchantTotal {
+  merchant: string | null;
+  n: number;
+  total: number;
+}
+
+// Biggest merchants in the range, across every envelope. Merchants are grouped
+// by their stored text, so two spellings of one shop count separately — the
+// alternative is fuzzy matching, which would silently merge distinct payees.
+export async function topMerchants(
+  env: Env,
+  sinceIso: string,
+  untilIso: string,
+  limit = 5,
+): Promise<MerchantTotal[]> {
+  const res = await env.DB.prepare(
+    `SELECT merchant, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM transactions WHERE occurred_at >= ? AND occurred_at < ?
+      GROUP BY merchant ORDER BY total DESC LIMIT ?`,
+  )
+    .bind(sinceIso, untilIso, Math.max(1, Math.min(20, limit)))
+    .all<MerchantTotal>();
+  return res.results ?? [];
+}
+
+// How much is filed to one envelope, over all time. Used to tell the user what
+// a deletion is about to take with it.
+export async function categoryTotals(
+  env: Env,
+  categoryId: number,
+): Promise<{ n: number; total: number }> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM transactions WHERE category_id = ?`,
+  )
+    .bind(categoryId)
+    .first<{ n: number; total: number }>();
+  return { n: row?.n ?? 0, total: row?.total ?? 0 };
+}
+
+// Delete an envelope. `purge` decides what happens to the charges filed to it:
+// false returns them to the main budget (the spending survives, and starts
+// counting against the main budget again), true deletes them outright.
+//
+// Charges are dealt with FIRST either way, so a failure between the two
+// statements can never leave rows pointing at an envelope that is gone.
+export async function deleteCategory(env: Env, id: number, purge: boolean): Promise<void> {
+  await env.DB.prepare(
+    purge
+      ? `DELETE FROM transactions WHERE category_id = ?`
+      : `UPDATE transactions SET category_id = NULL WHERE category_id = ?`,
+  )
+    .bind(id)
+    .run();
+  await env.DB.prepare(`DELETE FROM categories WHERE id = ?`).bind(id).run();
+}
+
 export async function setCategoryBudget(env: Env, id: number, amount: number): Promise<void> {
   await env.DB.prepare(`UPDATE categories SET amount = ? WHERE id = ?`).bind(amount, id).run();
 }

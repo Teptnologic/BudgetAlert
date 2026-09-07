@@ -5,6 +5,8 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { Env } from "../env";
+import { calendarFrom } from "../env";
+import type { Calendar } from "../core/period";
 import { INTENT_SCHEMA, MAX_ACTIONS, normalizeBatch, unknownIntent, type Intent } from "./schema";
 
 // Sonnet 5 is the default rather than Opus 5: this is a bounded extraction task
@@ -24,7 +26,7 @@ export interface InterpretContext {
   currency: string;
 }
 
-function systemPrompt(ctx: InterpretContext): string {
+function systemPrompt(ctx: InterpretContext, cal: Calendar): string {
   const cats = ctx.categories.length
     ? ctx.categories
         .map((c) => `- ${c.name} ("${c.label}") — ${c.amount} ${ctx.currency} per ${c.period}`)
@@ -40,13 +42,25 @@ function systemPrompt(ctx: InterpretContext): string {
         .join("\n")
     : "(none yet)";
 
+  // The user's local date, not UTC: a Saturday evening in California is already
+  // Sunday in UTC, and "last week" resolved against the wrong day lands the
+  // model a whole period off from the range the query will actually run over.
   const today = new Date();
-  const weekday = today.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+  const local = new Intl.DateTimeFormat("en-CA", {
+    timeZone: cal.timeZone,
+    weekday: "long",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(today);
+  const part = (t: string) => local.find((p) => p.type === t)?.value ?? "";
+  const weekStart = cal.weekStartsOn === 1 ? "Monday" : "Sunday";
 
   return [
     "You classify messages sent to a personal budget bot into a single structured intent.",
     "",
-    `Today is ${weekday}, ${today.toISOString().slice(0, 10)} (UTC). Budget weeks run Monday to Sunday.`,
+    `Today is ${part("weekday")}, ${part("year")}-${part("month")}-${part("day")} in ${cal.timeZone}. ` +
+      `Budget weeks begin on ${weekStart}. Use these, not UTC.`,
     "",
     "Existing budget categories (envelopes):",
     cats,
@@ -79,15 +93,36 @@ function systemPrompt(ctx: InterpretContext): string {
     "  counted against a different envelope that is move_transaction, and if the figure",
     "  is merely wrong that is set_transaction_amount — neither is a deletion. When you",
     "  cannot tell which of the three they mean, return 'unknown' and let them say.",
+    "- To take a charge back OUT of an envelope and onto the main budget, use",
+    "  unfile_transaction with a selector. 'move the last charge back to my main",
+    "  budget', 'that shouldn't be in the gift budget' → unfile_transaction.",
+    "  move_transaction always files INTO a named envelope and can never target the",
+    "  main budget, so it is the wrong action for this.",
+    "- To delete an envelope, use delete_category with its category name.",
+    "  purge_transactions decides what happens to the charges filed to it: leave it",
+    "  false and the spending survives on the main budget; set it true ONLY when the",
+    "  user plainly asks for the charges to go too ('delete the gift budget and",
+    "  everything in it', 'wipe the gift budget and its transactions'). 'delete the",
+    "  gift budget' on its own is false. When unsure, use false — spending records",
+    "  that survive can be deleted afterwards, deleted ones cannot come back.",
     "- Fields that do not apply take their empty value: \"\" for text, 0 for numbers,",
     "  'none' for period/window/selector_kind.",
     "- If the message is ambiguous, off-topic, or you would have to guess at an amount",
     "  or a category, return a single action 'unknown' with a short reason. Guessing moves",
     "  the user's money to the wrong place; asking is always cheaper.",
     "",
-    "Spending history:",
-    "- list_transactions shows a history. Set window to 'week', 'month', or 'year' for a",
-    "  whole calendar period, with period_offset 0 for the current one, 1 for the",
+    "Reports and history:",
+    "- report is an aggregated summary of one whole calendar period: totals, each",
+    "  envelope, and the biggest merchants. 'how did last quarter go?', 'give me a",
+    "  yearly report', 'summarize this month' → report, with window 'quarter'/'year'/",
+    "  'month'/'week' and period_offset counting back (0 = current, 1 = previous).",
+    "- Prefer report over list_transactions whenever the user wants an overview, and",
+    "  ALWAYS for a quarter or a year — listing every row of a year is unreadable.",
+    "  Use list_transactions only when they want the individual charges.",
+    "",
+    "- list_transactions shows individual charges. Set window to 'week', 'month',",
+    "  'quarter' or 'year' for a whole calendar period, with period_offset 0 for the",
+    "  current one, 1 for the",
     "  previous, and so on. 'my spending this week' → window 'week', period_offset 0;",
     "  'last week' → period_offset 1. Use window 'none' with limit N for a plain",
     "  'show my last N transactions' with no date range.",
@@ -130,7 +165,7 @@ export async function interpret(
         effort: "low",
         format: { type: "json_schema", schema: INTENT_SCHEMA },
       },
-      system: systemPrompt(ctx),
+      system: systemPrompt(ctx, calendarFrom(env)),
       messages: [{ role: "user", content: message }],
     });
 
