@@ -129,4 +129,110 @@ describe("parseTransaction", () => {
     expect(r?.amount).toBe(5);
     expect(r?.merchant).toBeNull();
   });
+
+  it("parses an AMEX Large Purchase Approved alert", () => {
+    const subject = "Large Purchase Approved";
+    const body = [
+      "As you requested, we're letting you know that this purchase was more than $1.00.",
+      "You can change the dollar amount of these large purchase notifications online.",
+      "ISLAND PACKERS",
+      "$144.00*",
+      "Sun, Sep 27, 2026",
+      "*The amount above may not reflect the final amount as some merchants issue a pre-authorization charge",
+    ].join("\n");
+    const r = parseTransaction(subject, body);
+    expect(r?.amount).toBe(144);
+    expect(r?.merchant).toBe("ISLAND PACKERS");
+    expect(r?.currency).toBe("USD");
+  });
+
+  it("parses an AMEX Large Purchase with a high threshold", () => {
+    const subject = "Large Purchase Approved";
+    const body = [
+      "As you requested, we're letting you know that this purchase was more than $500.00.",
+      "You can change the dollar amount of these large purchase notifications online.",
+      "WHOLE FOODS MKT #10234",
+      "$1,250.99*",
+      "Mon, Sep 28, 2026",
+      "*The amount above may not reflect the final amount",
+    ].join("\n");
+    const r = parseTransaction(subject, body);
+    expect(r?.amount).toBe(1250.99);
+    expect(r?.merchant).toBe("WHOLE FOODS MKT #10234");
+    expect(r?.currency).toBe("USD");
+  });
+
+  it("parses a forwarded AMEX Large Purchase email (real text/plain)", () => {
+    const subject = "Fwd: Large Purchase Approved";
+    const body = [
+      "---------- Forwarded message ---------",
+      "From: American Express <AmericanExpress@welcome.americanexpress.com>",
+      "Date: Sun, Sep 27, 2026 at 12:58 AM",
+      "Subject: Large Purchase Approved",
+      "To: <yyy@gmail.com>",
+      "",
+      "",
+      "See the details about this purchase",
+      "",
+      "*XIAOYAN XIE*",
+      "",
+      "Account Ending: 51006",
+      "",
+      "*There was a large purchase on your Card*",
+      "",
+      "Dear XIAOYAN XIE,",
+      "",
+      "As you requested, we're letting you know that this purchase was more than",
+      "$1.00.",
+      "",
+      "You can* change the dollar amount",
+      "*of these large purchase notifications online.",
+      "",
+      "ISLAND PACKERS",
+      "",
+      "$144.00*",
+      "",
+      "Sun, Sep 27, 2026",
+      "",
+      "*The amount above may not reflect the final amount as some merchants issue",
+      "a pre-authorization charge",
+      "",
+      "You can track this spending charge online",
+      "and be notified when the final amount is posted to your account.",
+      "",
+      "If you still have questions about this transaction, we suggest contacting",
+      "the merchant directly.",
+      "Contact us",
+      "Update your email address",
+      "Privacy statement",
+      "",
+      "To stop alerts click here",
+      "",
+      "Your account information is included above to help you recognize this as a",
+      "customer care email from American Express.",
+      "",
+      "© 2026 American Express. All rights reserved.",
+      "",
+      "SAM0FYI568",
+    ].join("\n");
+    const r = parseTransaction(subject, body);
+    expect(r?.amount).toBe(144);
+    expect(r?.merchant).toBe("ISLAND PACKERS");
+    expect(r?.currency).toBe("USD");
+  });
+
+  it("parses an AMEX Large Purchase with a dotted merchant name", () => {
+    const subject = "Large Purchase Approved";
+    const body = [
+      "As you requested, we're letting you know that this purchase was more than $1.00.",
+      "You can change the dollar amount of these large purchase notifications online.",
+      "AMAZON.COM",
+      "$89.47*",
+      "Tue, Sep 29, 2026",
+      "*The amount above may not reflect the final amount",
+    ].join("\n");
+    const r = parseTransaction(subject, body);
+    expect(r?.amount).toBe(89.47);
+    expect(r?.merchant).toBe("AMAZON.COM");
+  });
 });

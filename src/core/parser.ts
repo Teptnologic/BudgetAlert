@@ -152,9 +152,43 @@ function findLabelledMerchant(text: string): string | null {
   return merchant.length ? merchant : null;
 }
 
+// AMEX "Large Purchase Approved" alerts put the merchant and amount on separate
+// lines in the body, with the amount possibly trailing an asterisk:
+//   "ISLAND PACKERS"
+//   "$144.00*"
+//   "Sun, Sep 27, 2026"
+// The subject is "Large Purchase Approved" and the body contains the threshold
+// sentence "this purchase was more than $X.XX". We match the standalone amount
+// (with optional asterisk) that follows the merchant name.
+const amexLargePurchaseRule: Rule = {
+  name: "amex-large-purchase",
+  extract(subject, combined) {
+    if (!/large purchase approved/i.test(subject)) return null;
+    if (NON_SPEND.test(subject)) return null;
+    const m = combined.match(
+      /([$£€]|USD|GBP|EUR)\s?([0-9](?:[0-9,]*)(?:\.[0-9]{1,2})?)\s*\*/i,
+    );
+    if (!m) return null;
+    const amount = toNumber(m[2]);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    // Merchant is the all-caps name directly before the dollar amount (case-sensitive).
+    const before = combined.slice(0, m.index!);
+    const merchantMatch = before.match(/([A-Z][A-Z0-9 &'#*.\-]{0,60})\s*$/);
+    let merchant: string | null = merchantMatch
+      ? merchantMatch[1].trim().replace(/\s+/g, " ").replace(/\.+$/, "")
+      : null;
+    if (merchant !== null && !merchant.length) merchant = null;
+    return {
+      amount,
+      merchant,
+      currency: normalizeCurrency(m[1]),
+    };
+  },
+};
+
 // Bank-specific rules run first; add entries here for banks whose wording the
 // generic rule mis-parses. Each returns a ParsedTxn or null.
-const BANK_RULES: Rule[] = [chaseRule, wellsFargoRule];
+const BANK_RULES: Rule[] = [chaseRule, wellsFargoRule, amexLargePurchaseRule];
 
 const collapse = (s: string): string => (s ?? "").replace(/\s+/g, " ").trim();
 
