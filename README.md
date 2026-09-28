@@ -332,8 +332,9 @@ npm run reconcile -- --zip ~/Downloads/2026Finance.zip --d1 d1-transactions.json
 
 This reads Chase, Wells Fargo, Discover and AMEX exports and **writes nothing to
 D1**. It produces `out/proposed-changes.md`, which lists every insert, update and
-delete under a key (`I-0001`, `U-0001`, `D-0001`), and `out/reconcile.sql` to
-match. The rules are:
+delete under a key (`I-0001`, `U-0001`, `D-0001`). The same list is written to
+`out/proposed-changes.csv` for sorting in a spreadsheet, and `out/reconcile.sql`
+matches it. The rules are:
 
 - **Refunds don't count.** A fully refunded purchase is left out along with its
   refund. A partial one is kept at its net amount. A card-benefit credit (Uber

@@ -4,6 +4,7 @@ import { applyRefunds, merchantKey } from "../scripts/reconcile/refunds";
 import { merchantSimilarity, parseD1Export, reconcile, type D1Txn } from "../scripts/reconcile/diff";
 import { emitSql, occurredAt, parseSkip, planChanges, renderSql } from "../scripts/reconcile/emit-sql";
 import { localDayIso } from "../src/core/period";
+import { changeToTotal, renderChangesCsv } from "../scripts/reconcile/report";
 
 const CHASE = `Transaction Date,Post Date,Description,Category,Type,Amount,Memo
 09/22/2026,09/22/2026,LIMELIGHT MAMMOTH FRON,Travel,Return,368.22,
@@ -313,5 +314,40 @@ describe("keyed changes", () => {
     expect(skipped).toContain("-- Skipped: D-0001, I-0001");
     // Keys don't shift when others are struck.
     expect(skipped).toContain("-- I-0002");
+  });
+});
+
+describe("proposed-changes.csv", () => {
+  it("has one row per change and round-trips awkward merchant names", async () => {
+    const HEAD = "Transaction Date,Post Date,Description,Category,Type,Amount,Memo\n";
+    const csv =
+      HEAD +
+      '01/09/2026,01/11/2026,"MCDONALD\'S, ""THE"" ONE",Food & Drink,Sale,-9.83,\n' +
+      "09/09/2026,09/10/2026,LIMELIGHT MAMMOTH FRON,Travel,Sale,-368.22,\n" +
+      "09/22/2026,09/22/2026,LIMELIGHT MAMMOTH FRON,Travel,Return,368.22,\n";
+    const rec = reconcile(applyRefunds(normalizeFile("Chase1714.CSV", csv)).ledger, [
+      {
+        id: 7,
+        amount: 368.22,
+        merchant: "LIMELIGHT MAMMOTH FR",
+        occurred_at: occurredAt("2026-09-09"),
+        source: "email",
+        category_id: null,
+      },
+    ]);
+    const changes = await planChanges(rec);
+    const rows = parseCsv(renderChangesCsv(changes, parseSkip("D-0001"), "2026-07-20"));
+
+    expect(rows.map((r) => r.key)).toEqual(changes.map((c) => c.key));
+    expect(rows[0]).toMatchObject({ key: "D-0001", action: "delete", d1_id: "7", amount: "368.22", change_to_total: "-368.22", skipped: "yes" });
+    expect(rows[1]).toMatchObject({
+      key: "I-0001",
+      action: "insert",
+      merchant: 'MCDONALD\'S, "THE" ONE',
+      amount: "9.83",
+      window: "before-bot",
+      skipped: "",
+    });
+    expect(changes.map(changeToTotal)).toEqual([-368.22, 9.83]);
   });
 });

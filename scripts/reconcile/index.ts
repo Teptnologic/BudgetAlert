@@ -1,4 +1,4 @@
-// CLI: bank CSV exports + D1 export → out/reconcile.sql + out/proposed-changes.md
+// CLI: bank CSV exports + D1 export → out/reconcile.sql + out/proposed-changes.{md,csv}
 //
 //   npm run reconcile -- --zip ~/Downloads/2026Finance.zip --d1 d1-transactions.json
 //   npm run reconcile -- --dir ./2026Finance                 (no --d1: plan inserts only)
@@ -15,7 +15,7 @@ import { applyRefunds } from "./refunds";
 import { parseD1Export, reconcile } from "./diff";
 import { parseSkip, planChanges, renderSql } from "./emit-sql";
 import { localDayIso } from "../../src/core/period";
-import { renderReport } from "./report";
+import { renderChangesCsv, renderReport } from "./report";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -62,13 +62,14 @@ async function main(): Promise<void> {
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, "reconcile.sql"), renderSql(changes, skip));
   writeFileSync(join(out, "proposed-changes.md"), renderReport({ rows, refunds, rec, changes, skip, botStart }));
+  writeFileSync(join(out, "proposed-changes.csv"), renderChangesCsv(changes, skip, botStart));
   const live = changes.filter((c) => !skip.has(c.key));
   const n = (k: string) => live.filter((c) => c.kind === k).length;
   console.log(
     `${rows.length} statement rows, ${d1.length} D1 rows → ` +
       `delete ${n("delete")}, update ${n("update")}, insert ${n("insert")}` +
       (skip.size ? ` (${skip.size} skipped)` : "") +
-      `. Wrote ${out}/reconcile.sql and ${out}/proposed-changes.md`,
+      `. Wrote ${out}/reconcile.sql and ${out}/proposed-changes.{md,csv}`,
   );
 }
 

@@ -29,6 +29,51 @@ const d1Cell = (d: D1Txn) =>
   `#${d.id} ${$(d.amount)} ${d.merchant ?? "—"} (${localDayIso(new Date(d.occurred_at))})`;
 const bankCell = (l: LedgerRow) => `${$(l.net)} ${l.row.merchant} (${l.row.card} ${l.row.date})`;
 
+/** How a change moves the grand total: + for inserts, − for deletes, the difference for updates. */
+export function changeToTotal(c: Change): number {
+  return c.kind === "insert" ? c.amount : c.kind === "delete" ? -c.amount : c.amount - (c.was ?? 0);
+}
+const net = changeToTotal;
+
+const csvField = (v: string) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+
+/**
+ * The same changes as the Markdown, one CSV row each, for a spreadsheet.
+ * Struck keys stay in with `skipped = yes`, so nothing silently disappears.
+ */
+export function renderChangesCsv(changes: Change[], skip: Set<string>, botStart: string | null): string {
+  const head = [
+    "key",
+    "action",
+    "d1_id",
+    "date",
+    "card",
+    "merchant",
+    "amount",
+    "previous_amount",
+    "change_to_total",
+    "window",
+    "reason",
+    "skipped",
+  ];
+  const rows = changes.map((c) => [
+    c.key,
+    c.kind,
+    c.d1Id === undefined ? "" : String(c.d1Id),
+    c.date,
+    c.card ?? "",
+    c.merchant,
+    c.amount.toFixed(2),
+    c.was === undefined ? "" : c.was.toFixed(2),
+    changeToTotal(c).toFixed(2),
+    c.kind === "insert" && botStart ? (c.date < botStart ? "before-bot" : "after-bot") : "",
+    c.reason,
+    skip.has(c.key) ? "yes" : "",
+  ]);
+  // BOM first: Excel reads UTF-8 without one as Latin-1 and mangles "Chase …1714".
+  return "\uFEFF" + [head, ...rows].map((r) => r.map(csvField).join(",")).join("\r\n") + "\r\n";
+}
+
 export interface ReportInput {
   rows: BankRow[];
   refunds: RefundResult;
@@ -52,7 +97,6 @@ export function renderReport({ rows, refunds, rec, changes, skip, botStart }: Re
   if (!botStart) out.push("_No D1 export was given, so every kept charge is planned as an insert. Re-run with `--d1`._", "");
   if (skip.size) out.push(`Skipped: ${[...skip].sort().join(", ")}`, "");
 
-  const net = (c: Change) => (c.kind === "insert" ? c.amount : c.kind === "delete" ? -c.amount : c.amount - (c.was ?? 0));
   out.push("## Summary", "");
   out.push(
     table(
