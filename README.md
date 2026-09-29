@@ -319,9 +319,12 @@ water heater charged to the gift budget stays out of the weekly total. Ask for
 
 ## Backfilling history from card statements
 
-The bot only knows what it saw as alerts. To fill in everything before it was
-running — and whatever it missed since — reconcile your cards' CSV exports
-against what D1 already holds:
+The bot only knows what it saw as alerts. To fill in history from before it was
+running, you can reconcile your cards' CSV exports against what D1 already
+holds. This was done once, for January–September 2026. See
+[docs/backfill-2026.md](docs/backfill-2026.md) for what was done and why the
+same months must not be reconciled again. Spending from then on is tracked
+through alerts.
 
 ```bash
 npx wrangler d1 execute budgetalert --remote --json \
