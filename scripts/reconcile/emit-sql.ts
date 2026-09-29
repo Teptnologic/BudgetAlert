@@ -1,0 +1,147 @@
+// Reconciliation → keyed changes → SQL for `wrangler d1 execute --file`. Pure.
+//
+// Every change gets a stable key (I-0001 insert, U-0001 update, D-0001 delete)
+// so the user can strike any of them after reading the preview and regenerate
+// with `--skip`. Keys depend only on the inputs, so they survive a re-run.
+//
+// Writes go straight to D1 rather than through recordAndEvaluate, on purpose:
+// eight months of backfill must not fire threshold alerts at the group.
+
+import { sha256Hex } from "../../src/core/hash";
+import { dayRange, localDayIso } from "../../src/core/period";
+import type { Reconciliation } from "./diff";
+import type { LedgerRow } from "./refunds";
+
+const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
+const money = (n: number) => n.toFixed(2);
+
+/**
+ * Twelve hours past local midnight on the statement date, as ISO UTC — noon,
+ * or 11am/1pm on a daylight-saving day, and always safely inside that day.
+ */
+export function occurredAt(date: string): string {
+  const range = dayRange(date);
+  if (!range) throw new Error(`bad date ${date}`);
+  return new Date(range.start.getTime() + 12 * 3_600_000).toISOString();
+}
+
+/**
+ * Dedupe key for an imported row. `n` numbers identical lines on one day
+ * (two $10.96 grocery charges) so they stay two rows, and re-running the same
+ * import inserts nothing new.
+ */
+export async function importHash(bank: LedgerRow, n: number): Promise<string> {
+  const r = bank.row;
+  return sha256Hex(`import|${r.card}|${r.date}|${money(r.amount)}|${r.merchant}|${n}`);
+}
+
+export interface Change {
+  key: string;
+  kind: "insert" | "update" | "delete";
+  date: string; // local YYYY-MM-DD
+  card: string | null; // statement card, when one is involved
+  merchant: string;
+  amount: number; // insert: amount added · update: new amount · delete: amount removed
+  was?: number; // update: the amount it replaces
+  d1Id?: number;
+  reason: string;
+  sql: string;
+}
+
+export async function planChanges(rec: Reconciliation): Promise<Change[]> {
+  const inserts: Change[] = [];
+  const updates: Change[] = [];
+  const deletes: Change[] = [];
+
+  const seen = new Map<string, number>();
+  const ins = rec.outcomes
+    .flatMap((o) => (o.type === "insert" ? [o.bank] : []))
+    .sort((a, b) => a.row.date.localeCompare(b.row.date) || a.row.card.localeCompare(b.row.card) || a.row.id.localeCompare(b.row.id));
+  for (const bank of ins) {
+    const r = bank.row;
+    const k = `${r.card}|${r.date}|${money(r.amount)}|${r.merchant}`;
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    inserts.push({
+      key: "",
+      kind: "insert",
+      date: r.date,
+      card: r.card,
+      merchant: r.merchant,
+      amount: bank.net,
+      reason: bank.offsets.length ? `net of ${bank.offsets.map((o) => `${o.by.kind} $${money(o.amount)}`).join(", ")}` : "not in D1",
+      sql:
+        `INSERT OR IGNORE INTO transactions (amount, merchant, currency, occurred_at, source, raw_hash) VALUES (` +
+        `${money(bank.net)}, ${q(r.merchant)}, 'USD', ${q(occurredAt(r.date))}, 'import', ${q(await importHash(bank, n))});`,
+    });
+  }
+
+  for (const o of rec.outcomes) {
+    if (o.type === "update") {
+      updates.push({
+        key: "",
+        kind: "update",
+        date: localDayIso(new Date(o.d1.occurred_at)),
+        card: o.bank?.row.card ?? null,
+        merchant: o.d1.merchant ?? "—",
+        amount: o.amount,
+        was: o.d1.amount,
+        d1Id: o.d1.id,
+        reason: o.bank ? `${o.reason} (${o.bank.row.merchant} ${o.bank.row.date})` : o.reason,
+        sql: `UPDATE transactions SET amount = ${money(o.amount)} WHERE id = ${o.d1.id};`,
+      });
+    } else if (o.type === "delete") {
+      deletes.push({
+        key: "",
+        kind: "delete",
+        date: localDayIso(new Date(o.d1.occurred_at)),
+        card: o.bank?.row.card ?? null,
+        merchant: o.d1.merchant ?? "—",
+        amount: o.d1.amount,
+        d1Id: o.d1.id,
+        reason: o.bank ? `${o.reason} (${o.bank.row.merchant} ${o.bank.row.date})` : o.reason,
+        sql: `DELETE FROM transactions WHERE id = ${o.d1.id};`,
+      });
+    }
+  }
+  const byId = (a: Change, b: Change) => (a.d1Id ?? 0) - (b.d1Id ?? 0);
+  updates.sort(byId);
+  deletes.sort(byId);
+
+  const pad = (n: number) => String(n + 1).padStart(4, "0");
+  inserts.forEach((c, i) => (c.key = `I-${pad(i)}`));
+  updates.forEach((c, i) => (c.key = `U-${pad(i)}`));
+  deletes.forEach((c, i) => (c.key = `D-${pad(i)}`));
+  return [...deletes, ...updates, ...inserts];
+}
+
+/** Parse `--skip I-0012,D-0003` (commas or whitespace). */
+export function parseSkip(text: string | undefined): Set<string> {
+  return new Set((text ?? "").split(/[\s,]+/).map((s) => s.trim().toUpperCase()).filter(Boolean));
+}
+
+export function renderSql(changes: Change[], skip: Set<string> = new Set()): string {
+  const kept = changes.filter((c) => !skip.has(c.key));
+  const lines = [
+    "-- BudgetAlert history reconcile. Generated by scripts/reconcile — review",
+    "-- out/proposed-changes.md before applying. Idempotent: re-running changes nothing.",
+    skip.size ? `-- Skipped: ${[...skip].sort().join(", ")}` : "",
+    "",
+  ];
+  const section = (title: string, kind: Change["kind"]) => {
+    const rows = kept.filter((c) => c.kind === kind);
+    if (!rows.length) return;
+    lines.push(`-- ${title} (${rows.length})`);
+    for (const c of rows) lines.push(`${c.sql} -- ${c.key}`);
+    lines.push("");
+  };
+  section("Deletes", "delete");
+  section("Updates", "update");
+  section("Inserts", "insert");
+  return lines.join("\n");
+}
+
+/** Keyed SQL for a reconciliation in one step. */
+export async function emitSql(rec: Reconciliation, skip?: Set<string>): Promise<string> {
+  return renderSql(await planChanges(rec), skip);
+}

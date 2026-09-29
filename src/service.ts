@@ -22,12 +22,7 @@ import {
   listCategories,
 } from "./store/d1";
 import { sendMessage } from "./notify/telegram";
-
-async function sha256Hex(input: string): Promise<string> {
-  const data = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
+import { sha256Hex } from "./core/hash";
 
 // Record a parsed spend, then evaluate the budget and fire any newly-crossed
 // threshold alerts to the group. Called for every captured transaction.

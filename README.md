@@ -52,6 +52,7 @@ different chat platform later means swapping an adapter, not a rewrite.
 | `src/nl/resolve.ts` | Which transaction each selector in a batch means |
 | `src/router.ts` | HTTP routes: `/telegram`, `/inbound`, health |
 | `src/index.ts` | Worker entry: `email`, `fetch`, `scheduled` (digest + period reports) |
+| `scripts/reconcile/` | Offline CLI: card statement CSVs vs D1 → reviewable SQL (see [Backfilling history](#backfilling-history-from-card-statements)) |
 
 ## Natural language
 
@@ -315,6 +316,59 @@ about the wrong day.
 exclusive, money filed into a named envelope isn't weekly spending — a $166.67
 water heater charged to the gift budget stays out of the weekly total. Ask for
 `everything` to see both together, or name an envelope to see just that one.
+
+## Backfilling history from card statements
+
+The bot only knows what it saw as alerts. To fill in history from before it was
+running, you can reconcile your cards' CSV exports against what D1 already
+holds. This was done once, for January–September 2026. See
+[docs/backfill-2026.md](docs/backfill-2026.md) for what was done and why the
+same months must not be reconciled again. Spending from then on is tracked
+through alerts.
+
+```bash
+npx wrangler d1 execute budgetalert --remote --json \
+  --command "SELECT id, amount, merchant, occurred_at, source, category_id FROM transactions" \
+  > d1-transactions.json
+npm run reconcile -- --zip ~/Downloads/2026Finance.zip --d1 d1-transactions.json
+```
+
+This reads Chase, Wells Fargo, Discover and AMEX exports and **writes nothing to
+D1**. It produces `out/proposed-changes.md`, which lists every insert, update and
+delete under a key (`I-0001`, `U-0001`, `D-0001`). The same list is written to
+`out/proposed-changes.csv` for sorting in a spreadsheet, and `out/reconcile.sql`
+matches it. The rules are:
+
+- **Refunds don't count.** A fully refunded purchase is left out along with its
+  refund. A partial one is kept at its net amount. A card-benefit credit (Uber
+  One, dining, StubHub, …) counts as a refund of the purchase it paid for.
+  Payments and generic cashback are ignored. Annual fees count.
+- **D1 wins where it already has the spend.** It doesn't matter if D1 holds it
+  in a different shape. Examples: per-restaurant DoorDash alerts that the
+  statement bills as one order; a manual entry that rolls up two Uber rides; your
+  half of a shared bill; a tip-adjusted amount. Those rows keep their amount and
+  their envelope.
+- **Holds get fixed.** A $0.01 pre-authorization becomes the charge that posted,
+  or is deleted if it never did. A charge the statement shows as refunded is
+  deleted.
+
+Read the preview. Strike anything you disagree with and re-run:
+
+```bash
+npm run reconcile -- --zip … --d1 d1-transactions.json --skip I-0012,D-0003
+```
+
+Then back up and apply:
+
+```bash
+npx wrangler d1 export budgetalert --remote --output backup.sql
+npx wrangler d1 execute budgetalert --remote --file=out/reconcile.sql
+```
+
+Imported rows are written with `source = 'import'` and a dedupe hash, so applying
+the file twice changes nothing. They go straight to D1 rather than through the
+alert pipeline, so a backfill never fires threshold alerts. They land in the
+main budget; file any into an envelope afterwards as usual.
 
 ## Setup
 

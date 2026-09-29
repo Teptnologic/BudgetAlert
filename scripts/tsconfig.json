@@ -1,0 +1,9 @@
+{
+  // The reconcile CLI runs under Node, not Workers, so it needs Node's types
+  // too. Kept apart from the root config so Worker code can't reach for fs.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "node"]
+  },
+  "include": [".", "../test/reconcile.test.ts"]
+}
