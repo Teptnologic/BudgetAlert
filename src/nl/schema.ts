@@ -101,7 +101,7 @@ const ACTION_SCHEMA = {
     date: {
       type: "string",
       description:
-        "For window 'day' ONLY: the single calendar date being asked about, as YYYY-MM-DD in the user's local timezone. Resolve relative wording against today's date given above — 'yesterday' becomes that date, not a day count. Empty string for every other window.",
+        "A single calendar date as YYYY-MM-DD in the user's local timezone, used in exactly two places. (1) For window 'day': the date being asked about. (2) For move_transaction, set_transaction_amount, remove_transaction and unfile_transaction: the day the charge posted, when the user names one ('the $108.65 on 10-06') — it narrows which transaction the selector picks. Resolve relative wording against today's date given above — 'yesterday' becomes that date, not a day count. Empty string everywhere else.",
     },
     period: {
       type: "string",
@@ -129,7 +129,7 @@ const ACTION_SCHEMA = {
       type: "string",
       enum: ["last", "amount", "merchant", "none"],
       description:
-        "How to find the transaction for move_transaction, set_transaction_amount, or remove_transaction. 'last' = most recent. 'none' when not applicable.",
+        "How to find the transaction for move_transaction, set_transaction_amount, remove_transaction or unfile_transaction. 'last' = most recent. 'none' when not applicable. A day the user names goes in date, alongside the selector.",
     },
     selector_value: {
       type: "string",

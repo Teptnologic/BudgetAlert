@@ -387,23 +387,37 @@ export async function getTransaction(env: Env, id: number): Promise<FullTxnRow |
 //
 // `limit` bounds the read, and callers ask for one more than they can act on so
 // they can tell "exactly N" from "at least N".
+//
+// `day` narrows the search to one local day, as a half-open [since, until)
+// range. A recurring bill matches its amount every month; "the $108.65 on
+// 10-06" is only unambiguous if the date takes part in the lookup.
 export async function findTransactions(
   env: Env,
   kind: "last" | "amount" | "merchant",
   value: string | number,
   limit = 10,
+  day?: { sinceIso: string; untilIso: string },
 ): Promise<FullTxnRow[]> {
   const cols = `SELECT id, amount, merchant, occurred_at, category_id FROM transactions`;
   const order = `ORDER BY occurred_at DESC, id DESC LIMIT ?`;
   const n = Math.max(1, Math.min(50, Math.trunc(limit)));
 
-  const stmt =
-    kind === "last"
-      ? env.DB.prepare(`${cols} ${order}`).bind(n)
-      : kind === "amount"
-        ? // Tolerate float representation drift rather than comparing for equality.
-          env.DB.prepare(`${cols} WHERE ABS(amount - ?) < 0.005 ${order}`).bind(Number(value), n)
-        : env.DB.prepare(`${cols} WHERE merchant LIKE ? ${order}`).bind(`%${String(value)}%`, n);
+  const where: string[] = [];
+  const binds: unknown[] = [];
+  if (kind === "amount") {
+    // Tolerate float representation drift rather than comparing for equality.
+    where.push(`ABS(amount - ?) < 0.005`);
+    binds.push(Number(value));
+  } else if (kind === "merchant") {
+    where.push(`merchant LIKE ?`);
+    binds.push(`%${String(value)}%`);
+  }
+  if (day) {
+    where.push(`occurred_at >= ? AND occurred_at < ?`);
+    binds.push(day.sinceIso, day.untilIso);
+  }
+  const clause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+  const stmt = env.DB.prepare(`${cols}${clause} ${order}`).bind(...binds, n);
 
   const res = await stmt.all<FullTxnRow>();
   return res.results ?? [];

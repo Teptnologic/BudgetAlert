@@ -364,6 +364,13 @@ function fakeEnv(opts: {
       const needle = String(binds[0]).replace(/%/g, "").toLowerCase();
       pool = pool.filter((t) => (t.merchant ?? "").toLowerCase().includes(needle));
     }
+    // findTransactions()' day narrowing: its bounds follow the selector's own
+    // bind, if there is one.
+    if (sql.includes("occurred_at >= ? AND occurred_at < ?")) {
+      const at = sql.includes("ABS(amount") || sql.includes("merchant LIKE") ? 1 : 0;
+      const [since, until] = [binds[at], binds[at + 1]];
+      pool = pool.filter((t) => (t.occurred_at ?? "") >= since && (t.occurred_at ?? "") < until);
+    }
     // listRecent() scopes in SQL. Mirrored here so a test can actually catch a
     // listing that filters after the LIMIT instead of before it.
     if (sql.includes("WHERE category_id = ?")) {
@@ -693,6 +700,19 @@ describe("describeIntent", () => {
     expect(which({ selector_kind: "last" })).toBe("Most recent charge");
     expect(which({ selector_kind: "amount", amount: 200 })).toBe("The $200.00 charge");
     expect(which({ selector_kind: "merchant", selector_value: "TOP GOLF" })).toContain("TOP GOLF");
+  });
+
+  // A day that narrows the search has to show in the parse, or a misread date
+  // looks exactly like a missing charge.
+  it("shows the day a selector was narrowed to", () => {
+    const which = (raw: any) => asMap({ action: "move_transaction", category: "gift", ...raw })["Which charge"];
+    expect(which({ selector_kind: "amount", amount: 108.65, date: "2026-10-06" })).toBe(
+      "The $108.65 charge on 2026-10-06",
+    );
+    expect(which({ selector_kind: "last", date: "2026-10-06" })).toBe("Last charge on 2026-10-06");
+    expect(which({ selector_kind: "merchant", selector_value: "PG&E", date: "2026-10-06" })).toBe(
+      "Matching “PG&E” on 2026-10-06",
+    );
   });
 
   // The distinction that matters most: which transaction vs what it becomes.
@@ -1904,9 +1924,9 @@ describe("selector resolution across a batch", () => {
     expect(fields["Option 2"]).toBe("$0.01 — FD *CA DMV 640 (09-06)");
   });
 
-  // Past a handful, a list of buttons is not an answer — ask for a better
-  // selector instead of offering twelve near-identical rows.
-  it("refuses to offer a choice between too many matches", async () => {
+  // Past a handful, a list of buttons is not an answer on its own — but a dead
+  // end is worse. The newest few are offered, with a hint for the rest.
+  it("offers the newest few when there are too many matches", async () => {
     const many = Array.from({ length: 8 }, (_, i) => ({
       id: 100 + i,
       amount: 0.01,
@@ -1918,8 +1938,51 @@ describe("selector resolution across a batch", () => {
       normalizeBatch({ actions: [correct({ selector_kind: "amount", amount: 0.01 }, 616)] }),
     );
     expect(steps[0].ok).toBe(false);
-    expect(steps[0].candidates).toBeUndefined();
-    expect(steps[0].text).toContain("too many to choose from");
+    expect(steps[0].candidates?.map((t) => t.id)).toEqual([100, 101, 102, 103, 104]);
+    expect(steps[0].text).toContain("8 transactions matching $0.01");
+    expect(steps[0].text).toContain("here are the 5 most recent");
+  });
+
+  // The amount was already exact to the cent; asking for it "more exactly" is
+  // advice the user can't take. The hint names only what the message lacked.
+  it("hints at what the message didn't say, never at what it did", async () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({
+      id: 100 + i,
+      amount: 108.65,
+      merchant: "PG&E",
+      occurred_at: "2026-09-06T18:00:00.000Z",
+    }));
+    const plan = (raw: any) =>
+      planBatch(fakeEnv({ transactions: many }), normalizeBatch({ actions: [correct(raw, 1)] }));
+
+    const byAmount = (await plan({ selector_kind: "amount", amount: 108.65 }))[0].text;
+    expect(byAmount).toContain("the day it posted");
+    expect(byAmount).toContain("the merchant");
+    expect(byAmount).not.toMatch(/amount more exactly/);
+
+    const dated = (await plan({ selector_kind: "amount", amount: 108.65, date: "2026-09-06" }))[0].text;
+    expect(dated).toContain("matching $108.65 on 2026-09-06");
+    expect(dated).not.toContain("the day it posted");
+    expect(dated).toContain("the merchant");
+
+    const byName = (await plan({ selector_kind: "merchant", selector_value: "PG&E" }))[0].text;
+    expect(byName).toContain("the amount");
+    expect(byName).not.toContain("the merchant");
+  });
+
+  it("says 'at least' when the search stopped before the end", async () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      id: 100 + i,
+      amount: 0.01,
+      merchant: `HOLD ${i}`,
+      occurred_at: "2026-09-06T18:00:00.000Z",
+    }));
+    const steps = await planBatch(
+      fakeEnv({ transactions: many }),
+      normalizeBatch({ actions: [correct({ selector_kind: "amount", amount: 0.01 }, 616)] }),
+    );
+    expect(steps[0].text).toMatch(/\d+\+ transactions/);
+    expect(steps[0].candidates).toHaveLength(5);
   });
 
   // 'last' means "whatever is newest that nobody else claimed", so it must not
@@ -1936,6 +1999,87 @@ describe("selector resolution across a batch", () => {
     );
     expect(steps.map((s) => s.ok)).toEqual([true, true]);
     expect(steps.map((s) => s.txnId)).toEqual([20, 31]);
+  });
+});
+
+// "move 108.65 on 10-06 to utilities and car" — a monthly bill matches its
+// amount every month, so the day it posted is the only thing that tells this
+// month's apart. It has to reach the lookup, not just the parse.
+describe("narrowing a selector to one day", () => {
+  const bills = [
+    // 10-06 22:30 in Los Angeles — already 10-07 in UTC. The day is LOCAL.
+    { id: 210, amount: 108.65, merchant: "PG&E", occurred_at: "2026-10-07T05:30:00.000Z" },
+    // 10-05 22:00 in Los Angeles, though UTC says 10-06.
+    { id: 209, amount: 108.65, merchant: "PG&E", occurred_at: "2026-10-06T05:00:00.000Z" },
+    ...Array.from({ length: 7 }, (_, i) => ({
+      id: 200 + i,
+      amount: 108.65,
+      merchant: "PG&E",
+      occurred_at: `2026-0${9 - i > 0 ? 9 - i : 1}-06T18:00:00.000Z`,
+    })),
+  ];
+  const categories = [
+    { id: 4, name: "utilities and car", label: "Utilities and car", amount: 3000, period: "yearly" },
+  ];
+  const move = (extra: any) =>
+    normalizeBatch({
+      actions: [
+        {
+          action: "move_transaction",
+          category: "utilities and car",
+          selector_kind: "amount",
+          amount: 108.65,
+          ...extra,
+        },
+      ],
+    });
+
+  it("keeps the date on a selector action", () => {
+    expect(move({ date: "2026-10-06" })[0].date).toBe("2026-10-06");
+  });
+
+  it("settles on the one charge that posted that local day", async () => {
+    const steps = await planBatch(
+      fakeEnv({ categories, transactions: bills }),
+      move({ date: "2026-10-06" }),
+    );
+    expect(steps[0].ok).toBe(true);
+    expect(steps[0].txnId).toBe(210);
+  });
+
+  it("stages a confirmation for the original message instead of refusing it", async () => {
+    const reply = await executeBatch(
+      fakeEnv({ categories, transactions: bills }),
+      move({ date: "2026-10-06" }),
+    );
+    expect(reply.text).toContain("Confirm this?");
+    expect(reply.text).toContain("The $108.65 charge on 2026-10-06");
+    expect(JSON.parse(reply.stage!.payload).actions[0].txnId).toBe(210);
+  });
+
+  it("names the day when nothing posted on it", async () => {
+    const steps = await planBatch(
+      fakeEnv({ categories, transactions: bills }),
+      move({ date: "2026-10-04" }),
+    );
+    expect(steps[0].ok).toBe(false);
+    expect(steps[0].text).toContain("No transaction matching $108.65 on 2026-10-04");
+  });
+
+  it("finds the newest charge of a day for 'last'", async () => {
+    const steps = await planBatch(
+      fakeEnv({ categories, transactions: bills }),
+      move({ selector_kind: "last", amount: 0, date: "2026-10-05" }),
+    );
+    expect(steps[0].txnId).toBe(209);
+  });
+
+  // Without the day the old behaviour remains — but as a choice, not a wall.
+  it("still offers the newest few when no day is named", async () => {
+    const reply = await executeBatch(fakeEnv({ categories, transactions: bills }), move({}));
+    expect(reply.text).toContain("Which charge did you mean?");
+    expect(reply.text).toContain("the day it posted");
+    expect(reply.stage?.choices).toHaveLength(5);
   });
 });
 
