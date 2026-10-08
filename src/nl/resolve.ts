@@ -19,15 +19,20 @@
 //   · 'last' takes the newest row nobody else has claimed;
 //   · whatever is still undecided is reported as ambiguous, for the caller to
 //     ask about, rather than guessed at.
+//
+// A step that names a day ("the $108.65 on 10-06") only searches that local
+// day. Without it a recurring bill matches its amount every single month.
 
 import type { Env } from "../env";
+import { calendarFrom } from "../env";
+import { dayRange } from "../core/period";
 import type { Intent } from "./schema";
 import { MAX_ACTIONS } from "./schema";
 import { findTransactions, getTransaction, type FullTxnRow } from "../store/d1";
 
 // How many candidates a "which one did you mean?" prompt can list. Past this a
 // list of buttons stops being an answer and starts being another problem, so
-// the user is asked to narrow it down instead.
+// the newest few are offered along with a hint on how to narrow it down.
 export const MAX_CANDIDATES = 5;
 
 // One step's worth of pool: enough rows that every other step in the batch
@@ -37,8 +42,10 @@ const POOL = MAX_CANDIDATES + MAX_ACTIONS;
 export type Resolution =
   | { kind: "one"; txn: FullTxnRow }
   | { kind: "none" }
-  | { kind: "ambiguous"; candidates: FullTxnRow[] }
-  | { kind: "too-many"; count: number; capped: boolean };
+  // `candidates` is at most MAX_CANDIDATES, newest first. `total` is how many
+  // rows actually matched (a lower bound when `capped`), so the caller can say
+  // when the list it offers is only the most recent slice.
+  | { kind: "ambiguous"; candidates: FullTxnRow[]; total: number; capped: boolean };
 
 const SELECTOR_ACTIONS: ReadonlySet<string> = new Set([
   "move_transaction",
@@ -99,12 +106,19 @@ export async function resolveBatch(
     }
   }
 
+  const cal = calendarFrom(env);
   const pool = new Map<number, FullTxnRow[]>();
   for (const s of open) {
     const kind = s.intent.selectorKind;
     if (kind === "none") continue; // unreachable: hasSelector() excluded these
     const value = kind === "amount" ? s.intent.amount : s.intent.selectorValue;
-    const rows = await findTransactions(env, kind, value, POOL);
+    // normalizeIntent() already blanked any date that isn't a real one, so a
+    // null range here means "no day named", never "a bad day ignored".
+    const range = s.intent.date ? dayRange(s.intent.date, cal) : null;
+    const day = range
+      ? { sinceIso: range.start.toISOString(), untilIso: range.end.toISOString() }
+      : undefined;
+    const rows = await findTransactions(env, kind, value, POOL, day);
     pool.set(s.index, kind === "merchant" ? preferExact(rows, s.intent.selectorValue) : rows);
   }
 
@@ -156,9 +170,18 @@ export async function resolveBatch(
     if (out.has(s.index)) continue;
     const rows = free(s.index);
     if (!rows.length) out.set(s.index, { kind: "none" });
-    else if (rows.length > MAX_CANDIDATES) {
-      out.set(s.index, { kind: "too-many", count: rows.length, capped: rows.length >= POOL });
-    } else out.set(s.index, { kind: "ambiguous", candidates: rows });
+    else {
+      // Past MAX_CANDIDATES, offer the newest few rather than refusing: a
+      // recurring charge the user wants is almost always the latest one, and a
+      // dead end makes them retype the whole message to get anywhere.
+      out.set(s.index, {
+        kind: "ambiguous",
+        candidates: rows.slice(0, MAX_CANDIDATES),
+        total: rows.length,
+        // The query stopped at POOL, so there may be more than it saw.
+        capped: (pool.get(s.index)?.length ?? 0) >= POOL,
+      });
+    }
   }
 
   return out;

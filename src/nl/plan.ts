@@ -102,9 +102,12 @@ export function describeIntent(intent: Intent, currency: string): IntentView {
   const add = (label: string, value: string) => fields.push([label, value]);
 
   const which = (): string => {
-    if (intent.selectorKind === "last") return "Most recent charge";
-    if (intent.selectorKind === "amount") return `The ${money(intent.amount)} charge`;
-    if (intent.selectorKind === "merchant") return `Matching “${intent.selectorValue}”`;
+    const on = intent.date ? ` on ${intent.date}` : "";
+    if (intent.selectorKind === "last") {
+      return intent.date ? `Last charge on ${intent.date}` : "Most recent charge";
+    }
+    if (intent.selectorKind === "amount") return `The ${money(intent.amount)} charge${on}`;
+    if (intent.selectorKind === "merchant") return `Matching “${intent.selectorValue}”${on}`;
     return "—";
   };
 
@@ -199,11 +202,26 @@ function esc(s: string): string {
 // How a selector reads in a message about it — shared by the four actions that
 // resolve a single existing transaction, so the wording can't drift apart.
 function selectorPhrase(intent: Intent, money: (n: number) => string, fallback: string): string {
-  return intent.selectorKind === "amount"
-    ? `matching ${money(intent.amount)}`
-    : intent.selectorKind === "merchant"
-      ? `matching “${esc(intent.selectorValue)}”`
-      : fallback;
+  const base =
+    intent.selectorKind === "amount"
+      ? `matching ${money(intent.amount)}`
+      : intent.selectorKind === "merchant"
+        ? `matching “${esc(intent.selectorValue)}”`
+        : fallback;
+  return intent.date ? `${base} on ${intent.date}` : base;
+}
+
+// How to narrow a selector down, offering only what the message didn't already
+// say. "Name the amount more exactly" is useless advice when the amount was
+// exact to the cent — the day it posted is what tells a recurring bill apart.
+function narrowHint(intent: Intent): string {
+  const ways: string[] = [];
+  if (!intent.date) ways.push("the day it posted (e.g. “on 10-06”)");
+  if (intent.selectorKind !== "merchant") ways.push("the merchant");
+  if (intent.selectorKind === "merchant") ways.push("the amount");
+  return ways.length > 1
+    ? `${ways.slice(0, -1).join(", ")} or ${ways[ways.length - 1]}`
+    : ways[0];
 }
 
 function noMatchText(intent: Intent, money: (n: number) => string, fallback: string): string {
@@ -236,22 +254,19 @@ function pickTxn(
   if (res.kind === "one") return { txn: res.txn };
 
   const phrase = selectorPhrase(intent, money, fallback);
-  if (res.kind === "too-many") {
-    return {
-      blocked: {
-        ok: false,
-        text:
-          `⚠️ ${res.count}${res.capped ? "+" : ""} transactions ${phrase} — ` +
-          `too many to choose from. Name the merchant or the amount more exactly.`,
-      },
-    };
-  }
   // Ambiguous: blocked, but answerable. The candidates ride along so the caller
-  // can ask instead of picking one and hoping.
+  // can ask instead of picking one and hoping. When there were more matches
+  // than buttons, the newest few are offered and the rest are one hint away.
+  const shown = res.candidates.length;
+  const text =
+    res.total > shown
+      ? `⚠️ ${res.total}${res.capped ? "+" : ""} transactions ${phrase} — ` +
+        `here are the ${shown} most recent. Not listed? Say it again with ${narrowHint(intent)}.`
+      : `⚠️ ${shown} transactions ${phrase} — which one?`;
   return {
     blocked: {
       ok: false,
-      text: `⚠️ ${res.candidates.length} transactions ${phrase} — which one?`,
+      text,
       candidates: res.candidates,
       resolved: res.candidates
         .slice(0, MAX_CANDIDATES)
